@@ -340,31 +340,31 @@ if page == "Beranda":
     <table class="author-table">
         <tr>
             <td>Nama</td>
-            <td>: Wahyu Aprian Hadiansyah</td>
+            <td>Wahyu Aprian Hadiansyah</td>
         </tr>
         <tr>
             <td>NPM</td>
-            <td>: 11121284</td>
+            <td>11121284</td>
         </tr>
         <tr>
             <td>Kelas</td>
-            <td>: 4KA23</td>
+            <td>4KA23</td>
         </tr>
         <tr>
             <td>Program Studi</td>
-            <td>: Sistem Informasi</td>
+            <td>Sistem Informasi</td>
         </tr>
         <tr>
             <td>Fakultas</td>
-            <td>: Ilmu Komputer dan Teknologi Informasi</td>
+            <td>Ilmu Komputer dan Teknologi Informasi</td>
         </tr>
         <tr>
             <td>Universitas</td>
-            <td>: Universitas Gunadarma</td>
+            <td>Universitas Gunadarma</td>
         </tr>
         <tr>
             <td>Tahun</td>
-            <td>: 2025</td>
+            <td>2025</td>
         </tr>
     </table>
     """, unsafe_allow_html=True)
