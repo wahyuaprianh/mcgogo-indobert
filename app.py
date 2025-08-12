@@ -408,12 +408,18 @@ elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
     st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
 
+    # Baris 1: Tanggal Mulai dan Tanggal Selesai
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Tanggal Mulai", datetime.date.today() - datetime.timedelta(days=30))
-        num_reviews = st.number_input("Jumlah ulasan yang diinginkan:", min_value=10, max_value=20000, value=100)
     with col2:
         end_date = st.date_input("Tanggal Selesai", datetime.date.today())
+
+    # Baris 2: Jumlah Ulasan, Bahasa, dan Negara
+    col3, col4 = st.columns(2)
+    with col3:
+        num_reviews = st.number_input("Jumlah ulasan yang diinginkan:", min_value=10, max_value=20000, value=100)
+    with col4:
         lang = st.selectbox("Pilih bahasa:", options=['id', 'en'], index=0)
         country = st.selectbox("Pilih negara:", options=['id', 'us'], index=0)
 
