@@ -165,23 +165,30 @@ tokenizer, model, device = load_model_and_tokenizer()
 # =========================
 # Fungsi Preprocessing
 # =========================
-@st.cache_data
 def load_stopwords():
-    try:
-        nltk.data.find('corpora/stopwords')
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('stopwords')
-        nltk.download('punkt')
-        
-    list_stopwords = stopwords.words('indonesian')
-    list_stopwords.extend([
+    """Memuat stopwords dari NLTK, daftar kustom manual, dan file lokal."""
+    # Muat stopwords dari NLTK
+    list_stopwords = set(stopwords.words('indonesian'))
+
+    # Tambahkan stopwords manual
+    list_stopwords.update([
         "yg","dg","rt","dgn","ny","d","klo","kalo","amp","biar","bikin",
         "bilang","gak","ga","krn","nya","nih","sih","si","tau","tdk","tuh",
         "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
         "nan","loh","yah","dr","gw","gue"
     ])
-    return set(list_stopwords)
+
+    # Cek dan muat stopwords dari file lokal jika ada
+    stopwords_file_path = './data/stopwords_id.txt'
+    if os.path.exists(stopwords_file_path):
+        with open(stopwords_file_path, 'r', encoding='utf-8') as file:
+            stopwords_from_file = [line.strip() for line in file if line.strip()]
+            list_stopwords.update(stopwords_from_file)
+            st.info(f"✅ Berhasil memuat {len(stopwords_from_file)} stopwords dari file lokal.")
+    else:
+        st.warning(f"File stopwords lokal tidak ditemukan: {stopwords_file_path}. Hanya menggunakan stopwords default.")
+
+    return list_stopwords
 
 list_stopwords = load_stopwords()
 
