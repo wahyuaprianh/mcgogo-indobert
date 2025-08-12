@@ -123,7 +123,7 @@ st.markdown(f"""
 # =========================
 # Path Model & Label Mapping
 # =========================
-MODEL_PATH = 'wahyuaprian/indobert-sentiment-mcgogo'
+MODEL_PATH = 'wahyuaprian/indobert-sentiment-mcgogo-8bit'
 APP_ID = "com.mobilechess.gp"
 LABEL_TO_INDEX = {'positive': 0, 'neutral': 1, 'negative': 2}
 INDEX_TO_LABEL = {0: 'positive', 1: 'neutral', 2: 'negative'}
