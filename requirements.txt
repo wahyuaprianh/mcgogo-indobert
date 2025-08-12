@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+scikit-learn==1.2.2 # Pastikan versi ini kompatibel dengan imblearn jika Anda menggunakannya offline
+imbalanced-learn==0.10.1 # Pastikan versi ini kompatibel dengan sklearn jika Anda menggunakannya offline
+transformers
+torch
+matplotlib
+seaborn
+wordcloud
+nltk
+emoji
