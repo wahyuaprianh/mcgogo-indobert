@@ -13,3 +13,4 @@ emoji
 plotly
 google-play-scraper
 sastrawi
+streamlit_carousel 
