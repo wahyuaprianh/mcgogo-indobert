@@ -184,7 +184,6 @@ def load_stopwords():
         with open(stopwords_file_path, 'r', encoding='utf-8') as file:
             stopwords_from_file = [line.strip() for line in file if line.strip()]
             list_stopwords.update(stopwords_from_file)
-            st.info(f"✅ Berhasil memuat {len(stopwords_from_file)} stopwords dari file lokal.")
     else:
         st.warning(f"File stopwords lokal tidak ditemukan: {stopwords_file_path}. Hanya menggunakan stopwords default.")
 
