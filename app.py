@@ -137,10 +137,24 @@ def load_model_and_tokenizer():
         tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
         config = BertConfig.from_pretrained(MODEL_PATH)
         config.num_labels = len(LABEL_TO_INDEX)
-        model = BertForSequenceClassification.from_pretrained(MODEL_PATH, config=config)
+        
+        # Load model dengan kuantisasi 8-bit dan auto device mapping
+        model = BertForSequenceClassification.from_pretrained(
+            MODEL_PATH, 
+            config=config,
+            load_in_8bit=True,
+            device_map="auto"
+        )
         model.eval()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
+        
+        # Tidak perlu lagi memindahkan model ke device secara manual
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # model.to(device)
+        
+        # Mengembalikan device default yang digunakan oleh model
+        # Karena device_map="auto", model sudah berada di device yang benar
+        device = model.device
+        
         return tokenizer, model, device
     except Exception as e:
         st.error(f"Gagal memuat model atau tokenizer: {e}. Pastikan Anda berada di direktori proyek yang benar.")
