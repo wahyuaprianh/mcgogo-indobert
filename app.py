@@ -123,7 +123,7 @@ st.markdown(f"""
 # =========================
 # Path Model & Label Mapping
 # =========================
-MODEL_PATH = './model/fine_tuned_indobert_model'
+MODEL_PATH = 'wahyuaprian/indobert-sentiment-mcgogo'
 APP_ID = "com.mobilechess.gp"
 LABEL_TO_INDEX = {'positive': 0, 'neutral': 1, 'negative': 2}
 INDEX_TO_LABEL = {0: 'positive', 1: 'neutral', 2: 'negative'}
