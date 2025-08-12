@@ -11,3 +11,4 @@ wordcloud
 nltk
 emoji
 plotly
+google-play-scraper
