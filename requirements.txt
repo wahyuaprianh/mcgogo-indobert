@@ -11,6 +11,7 @@ wordcloud
 nltk
 emoji
 plotly
+plotly-express
 google-play-scraper
 sastrawi
 streamlit_carousel 
