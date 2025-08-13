@@ -7,14 +7,20 @@ import nltk
 @st.cache_resource
 def setup_nltk():
     """Unduh resource NLTK yang dibutuhkan."""
-    # Cek dulu untuk menghindari unduhan berulang yang tidak perlu
-    try:
-        nltk.data.find('tokenizers/punkt')
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('punkt')
-        nltk.download('stopwords')
-    print("NLTK resources are ready.") # Pesan untuk debugging di logs
+    # List resource yang wajib ada
+    resources = [
+        'punkt',        # model sentence tokenizer
+        'punkt_tab',    # tabel tambahan tokenizer untuk bahasa non-Inggris
+        'stopwords'     # stopword list
+    ]
+
+    for resource in resources:
+        try:
+            nltk.data.find(f'tokenizers/{resource}') if 'punkt' in resource else nltk.data.find(f'corpora/{resource}')
+        except LookupError:
+            nltk.download(resource)
+
+    print("NLTK resources are ready.")  # Pesan untuk debugging di logs
 
 # Panggil fungsi setup ini di awal eksekusi aplikasi
 setup_nltk()
