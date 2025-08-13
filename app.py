@@ -733,8 +733,8 @@ elif page == "Prediksi":
                          color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
         st.plotly_chart(fig_pie, use_container_width=True)
             
-            csv = df_to_predict.to_csv(index=False).encode('utf-8')
-            st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
+        csv = df_to_predict.to_csv(index=False).encode('utf-8')
+        st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing' untuk memulai prediksi batch.")
 
