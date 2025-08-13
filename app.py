@@ -218,7 +218,7 @@ def clean_review(text):
     return text
 
 def tokenization_review_func(text):
-    return word_tokenize(text)
+    return word_tokenize(text, language='indonesian')
 
 def stopwords_removal_func_wrapper(words):
     return [w for w in words if w not in list_stopwords]
