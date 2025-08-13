@@ -4,35 +4,43 @@ import numpy as np
 import re
 import string
 import nltk
-nltk.download('punkt')
-nltk.download('stopwords')
+# Unduh resource NLTK secara senyap (sekali saja)
+for pkg in ["punkt", "stopwords"]:
+    try:
+        nltk.data.find(f"tokenizers/{pkg}" if pkg == "punkt" else f"corpora/{pkg}")
+    except LookupError:
+        nltk.download(pkg, quiet=True)
+
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns  # tetap diimport jika nanti Anda butuh
 import plotly.express as px
 import plotly.graph_objects as go
+
 from transformers import BertTokenizer, BertForSequenceClassification, BertConfig
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix, classification_report
 import time
 import datetime
-from google_play_scraper import Sort, reviews_all
+
+# PENTING: gunakan reviews() agar bisa batasi jumlah ulasan
+from google_play_scraper import Sort, reviews
 from nltk import ngrams
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 from streamlit_carousel import carousel
-import base64 # Modul untuk encoding Base64
-import os # Modul untuk memeriksa path file
+import base64
+import os
 
 # =========================
 # Fungsi untuk mengubah gambar menjadi Base64
 # =========================
 @st.cache_data
 def get_image_as_base64(path):
-    """Fungsi ini membaca file gambar lokal dan mengubahnya menjadi string Base64."""
+    """Baca file gambar lokal dan ubah menjadi Base64."""
     if not os.path.exists(path):
         return None
     with open(path, "rb") as image_file:
@@ -46,12 +54,9 @@ st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go
 # =========================
 # Styling Modern Minimalis
 # =========================
-# Panggil fungsi untuk mendapatkan gambar header dalam format Base64
-# Pastikan Anda memiliki file 'header.png' di dalam folder 'image'
 header_image_path = 'image/fix.png'
 img_base64 = get_image_as_base64(header_image_path)
 
-# Siapkan style CSS. Jika gambar ditemukan, gunakan sebagai background. Jika tidak, gunakan warna solid.
 if img_base64:
     background_style = f"""
         background-image: url(data:image/png;base64,{img_base64});
@@ -59,9 +64,7 @@ if img_base64:
         background-position: center;
     """
 else:
-    # Fallback jika gambar tidak ditemukan
     background_style = "background-color: #27272a;"
-
 
 st.markdown(f"""
 <style>
@@ -97,15 +100,11 @@ st.markdown(f"""
     {background_style}
     padding: 2em;
     border-radius: 12px;
-    color: white; /* Mengubah warna teks default di dalam card menjadi putih */
+    color: white;
 }}
-
-/* Memastikan semua teks utama di dalam card menjadi putih agar kontras */
-.main-card h1, .main-card h2, .main-card h3, .main-card p, .main-card div[data-testid="stMarkdown"], .main-card .st-emotion-cache-1g6goon {{
+.main-card h1, .main-card h2, .main-card h3, .main-card p, .main-card div[data-testid="stMarkdown"] {{
     color: white !important;
 }}
-
-/* Styling untuk tabel informasi penyusun */
 .author-table {{
     width: 100%;
     border-collapse: collapse;
@@ -117,7 +116,7 @@ st.markdown(f"""
 }}
 .author-table td:first-child {{
     font-weight: bold;
-    width: 150px; /* Atur lebar kolom label */
+    width: 150px;
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -131,7 +130,7 @@ LABEL_TO_INDEX = {'positive': 0, 'neutral': 1, 'negative': 2}
 INDEX_TO_LABEL = {0: 'positive', 1: 'neutral', 2: 'negative'}
 
 # =========================
-# Load Model dan Tokenizer
+# Load Model dan Tokenizer (dengan fallback)
 # =========================
 @st.cache_resource
 def load_model_and_tokenizer():
@@ -139,27 +138,31 @@ def load_model_and_tokenizer():
         tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
         config = BertConfig.from_pretrained(MODEL_PATH)
         config.num_labels = len(LABEL_TO_INDEX)
-        
-        # Load model dengan kuantisasi 8-bit dan auto device mapping
-        model = BertForSequenceClassification.from_pretrained(
-            MODEL_PATH, 
-            config=config,
-            load_in_8bit=True,
-            device_map="auto"
-        )
+
+        model = None
+        device = torch.device("cpu")
+        # Coba 8bit jika bitsandbytes & GPU tersedia
+        try:
+            model = BertForSequenceClassification.from_pretrained(
+                MODEL_PATH,
+                config=config,
+                load_in_8bit=True,
+                device_map="auto"
+            )
+            # deteksi device salah satu param
+            device = next(model.parameters()).device
+        except Exception as e8:
+            # Fallback ke float32; pakai GPU bila ada
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = BertForSequenceClassification.from_pretrained(
+                MODEL_PATH,
+                config=config
+            ).to(device)
+
         model.eval()
-        
-        # Tidak perlu lagi memindahkan model ke device secara manual
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # model.to(device)
-        
-        # Mengembalikan device default yang digunakan oleh model
-        # Karena device_map="auto", model sudah berada di device yang benar
-        device = model.device
-        
         return tokenizer, model, device
     except Exception as e:
-        st.error(f"Gagal memuat model atau tokenizer: {e}. Pastikan Anda berada di direktori proyek yang benar.")
+        st.error(f"Gagal memuat model/tokenizer: {e}")
         st.stop()
 
 tokenizer, model, device = load_model_and_tokenizer()
@@ -169,26 +172,23 @@ tokenizer, model, device = load_model_and_tokenizer()
 # =========================
 def load_stopwords():
     """Memuat stopwords dari NLTK, daftar kustom manual, dan file lokal."""
-    # Muat stopwords dari NLTK
     list_stopwords = set(stopwords.words('indonesian'))
-
-    # Tambahkan stopwords manual
     list_stopwords.update([
         "yg","dg","rt","dgn","ny","d","klo","kalo","amp","biar","bikin",
         "bilang","gak","ga","krn","nya","nih","sih","si","tau","tdk","tuh",
         "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
         "nan","loh","yah","dr","gw","gue"
     ])
-
-    # Cek dan muat stopwords dari file lokal jika ada
     stopwords_file_path = './data/stopwords_id.txt'
     if os.path.exists(stopwords_file_path):
-        with open(stopwords_file_path, 'r', encoding='utf-8') as file:
-            stopwords_from_file = [line.strip() for line in file if line.strip()]
-            list_stopwords.update(stopwords_from_file)
+        try:
+            with open(stopwords_file_path, 'r', encoding='utf-8') as file:
+                stopwords_from_file = [line.strip() for line in file if line.strip()]
+                list_stopwords.update(stopwords_from_file)
+        except Exception as e:
+            st.warning(f"Gagal memuat stopwords lokal: {e}. Menggunakan bawaan NLTK + manual.")
     else:
         st.warning(f"File stopwords lokal tidak ditemukan: {stopwords_file_path}. Hanya menggunakan stopwords default.")
-
     return list_stopwords
 
 list_stopwords = load_stopwords()
@@ -196,26 +196,26 @@ list_stopwords = load_stopwords()
 @st.cache_data
 def load_kamus_baku():
     kamus_baku_path = './data/kamus_baku.csv'
+    if not os.path.exists(kamus_baku_path):
+        st.warning(f"File kamus baku tidak ditemukan: {kamus_baku_path}. Normalisasi kata tidak akan lengkap.")
+        return {}
     df_kamus = pd.read_csv(kamus_baku_path, encoding='latin-1')
     return dict(zip(df_kamus.iloc[:,0], df_kamus.iloc[:,1]))
 
 normalizad_word_dict = load_kamus_baku()
 
-character_for_cleaning = list(string.ascii_letters) + list(".,;:-...?!()[]{}<>\"/\\#-@")
-
-def repeatcharClean(text):
-    for char in character_for_cleaning:
-        for n in range(5,2,-1):
-            text = text.replace(char*n, char)
-    return text
+# Optimasi: rapikan karakter berulang (>=3 jadi 1)
+_repeat_re = re.compile(r'(.)\1{2,}')
+def repeatcharClean(text: str) -> str:
+    return _repeat_re.sub(r'\1', text)
 
 def clean_review(text):
     if not isinstance(text, str):
         return ""
     text = text.lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"http\S+|www\S+", " ", text)
     emoji_pattern = re.compile("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]+", flags=re.UNICODE)
-    text = emoji_pattern.sub(r'', text)
+    text = emoji_pattern.sub(' ', text)
     text = re.sub(r'#(\S+)', r'\1', text)
     text = re.sub('[^a-zA-Z]+', ' ', text)
     text = repeatcharClean(text)
@@ -327,14 +327,12 @@ st.markdown('<div class="main-card">', unsafe_allow_html=True)
 if page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
     
-    # Bagian untuk gambar utama (DIPINDAHKAN KE ATAS)
     try:
         st.image("image/home.jpg", use_container_width=True)
     except Exception:
         st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_container_width=True)
         st.info("Gambar 'image/home.jpg' tidak ditemukan. Menampilkan gambar placeholder.")
     
-    # --- Teks Deskripsi (REVISI) ---
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
 
@@ -343,7 +341,6 @@ if page == "Beranda":
     Dasbor ini dibuat sebagai bagian dari pemenuhan tugas akhir yang disusun oleh:
     """)
     
-    # --- Tabel Informasi Penyusun (REVISI) ---
     st.markdown("""
     <table class="author-table">
         <tr>
@@ -377,14 +374,10 @@ if page == "Beranda":
     </table>
     """, unsafe_allow_html=True)
 
-
     st.markdown("<br>", unsafe_allow_html=True)
 
     # --- BAGIAN CAROUSEL ---
     st.subheader("Sinergi Hero Magic Chess Go Go")
-    
-    # Data untuk carousel
-    # Pastikan path gambar lokal Anda sudah benar.
     items = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
         {"title": "", "text": "", "img": "image/astro power.jpg"},
@@ -403,24 +396,24 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/the inferno.jpg"},
         {"title": "", "text": "", "img": "image/vonetis sea.jpg"},
     ]
-    
-    carousel(items=items)
+    try:
+        carousel(items=items)
+    except Exception as e:
+        st.warning(f"Carousel tidak dapat ditampilkan: {e}")
 
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
     st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
 
-    # Baris 1: Tanggal Mulai dan Tanggal Selesai
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Tanggal Mulai", datetime.date.today() - datetime.timedelta(days=30))
     with col2:
         end_date = st.date_input("Tanggal Selesai", datetime.date.today())
 
-    # Baris 2: Jumlah Ulasan, Bahasa, dan Negara
     col3, col4 = st.columns(2)
     with col3:
-        num_reviews = st.number_input("Jumlah ulasan yang diinginkan:", min_value=10, max_value=20000, value=100)
+        num_reviews = st.number_input("Jumlah ulasan yang diinginkan:", min_value=10, max_value=20000, value=100, step=10)
     with col4:
         lang = st.selectbox("Pilih bahasa:", options=['id', 'en'], index=0)
         country = st.selectbox("Pilih negara:", options=['id', 'us'], index=0)
@@ -431,38 +424,50 @@ elif page == "Scraping Data":
     st.info("Aplikasi akan mengambil ulasan terbaru, memfilternya sesuai rentang tanggal, lalu memilih jumlah yang Anda inginkan.")
 
     if st.button("Mulai Scraping", use_container_width=True):
-        if num_reviews == 0:
+        if num_reviews <= 0:
             st.error("Jumlah ulasan tidak boleh 0.")
         else:
-            with st.spinner("Mengambil sejumlah besar ulasan..."):
+            with st.spinner("Mengambil ulasan..."):
                 try:
-                    scraped_reviews = reviews_all(
+                    # gunakan reviews() agar count berfungsi
+                    raw, _ = reviews(
                         APP_ID,
                         lang=lang,
                         country=country,
                         sort=Sort.NEWEST,
-                        count=num_reviews * 2 # Ambil lebih banyak untuk difilter
+                        count=int(num_reviews*2)  # ambil ekstra untuk jaga-jaga setelah filter tanggal
                     )
-                    
-                    if not scraped_reviews:
+                    if not raw:
                         st.warning("Tidak ada ulasan yang ditemukan. Silakan cek rentang tanggal.")
                         st.session_state.df_scraped = pd.DataFrame()
                     else:
-                        df_scraped = pd.DataFrame(scraped_reviews)
+                        df_scraped = pd.DataFrame(raw)
+                        # pastikan kolom 'at' ada
+                        if 'at' not in df_scraped.columns:
+                            st.error("Struktur data dari Play Store berubah. Kolom 'at' tidak ditemukan.")
+                            st.stop()
+
                         df_scraped['timestamp'] = pd.to_datetime(df_scraped['at'])
-                        
                         df_filtered_by_date = df_scraped[(df_scraped['timestamp'] >= start_dt) & (df_scraped['timestamp'] <= end_dt)].reset_index(drop=True)
                         
                         if df_filtered_by_date.empty:
-                            st.warning("Tidak ada ulasan yang ditemukan dalam rentang tanggal tersebut. Coba rentang tanggal yang lebih luas.")
+                            st.warning("Tidak ada ulasan pada rentang tanggal tersebut. Coba rentang yang lebih luas.")
                             st.session_state.df_scraped = pd.DataFrame()
                         else:
-                            final_df = df_filtered_by_date.head(num_reviews)
-                            
-                            final_df['category'] = final_df['score'].apply(map_score_to_sentiment)
-
-                            final_df = final_df.rename(columns={'content': 'review_text'})
-                            final_df = final_df.drop(columns=['at'])
+                            final_df = df_filtered_by_date.head(int(num_reviews)).copy()
+                            # mapping sentimen dari score
+                            if 'score' in final_df.columns:
+                                final_df['category'] = final_df['score'].apply(map_score_to_sentiment)
+                            else:
+                                final_df['category'] = 'unknown'
+                            # pastikan kolom review_text tersedia
+                            if 'content' in final_df.columns:
+                                final_df = final_df.rename(columns={'content': 'review_text'})
+                            elif 'review_text' not in final_df.columns:
+                                final_df['review_text'] = final_df.get('body', '')
+                            # drop kolom 'at' bila ada
+                            if 'at' in final_df.columns:
+                                final_df = final_df.drop(columns=['at'])
 
                             st.success(f"✅ Berhasil mengambil {len(final_df)} ulasan dalam rentang tanggal yang dipilih!")
                             st.dataframe(final_df[['review_text', 'category', 'score', 'timestamp']].head())
@@ -479,13 +484,14 @@ elif page == "Preprocessing":
     st.write("Disarankan untuk mengunggah file yang sudah memiliki label sentimen (positive, negative, neutral) jika ingin melakukan evaluasi model.")
 
     df_raw = None
-    if 'df_scraped' in st.session_state and not st.session_state.df_scraped.empty:
+    if 'df_scraped' in st.session_state and not getattr(st.session_state, "df_scraped", pd.DataFrame()).empty:
         st.subheader("Pilih Sumber Data")
         use_scraped = st.checkbox("Gunakan data yang telah di-scraping", value=True)
         if use_scraped:
             df_raw = st.session_state.df_scraped
             st.subheader("📄 Data Asli (dari Scraping)")
-            st.dataframe(df_raw[['review_text', 'category']].head())
+            cols_to_show = ['review_text', 'category'] if 'category' in df_raw.columns else ['review_text']
+            st.dataframe(df_raw[cols_to_show].head())
     
     if df_raw is None:
         uploaded_file = st.file_uploader("Atau, pilih file TSV/CSV", type=["tsv", "csv"])
@@ -498,7 +504,8 @@ elif page == "Preprocessing":
                     df_raw.columns = ['review_text']
                     df_raw['category'] = 'unknown'
             st.subheader("📄 Data Asli (dari File)")
-            st.dataframe(df_raw[['review_text', 'category']].head())
+            cols_to_show = ['review_text', 'category'] if 'category' in df_raw.columns else ['review_text']
+            st.dataframe(df_raw[cols_to_show].head())
             
     if df_raw is not None and not df_raw.empty:
         is_labeled = ('category' in df_raw.columns and df_raw['category'].isin(LABEL_TO_INDEX.keys()).any())
@@ -530,13 +537,13 @@ elif page == "Preprocessing":
                     xaxis_title='Bulan dan Tahun',
                     yaxis_title='Jumlah Ulasan'
                 )
-                st.plotly_chart(fig)
+                st.plotly_chart(fig, use_container_width=True)
             else:
                 counts = df_raw['category'].value_counts().reset_index()
                 counts.columns = ['category', 'count']
                 fig = px.bar(counts, x='category', y='count', title='Distribusi Sentimen Data Asli',
                              color='category', color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
-                st.plotly_chart(fig)
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Data yang Anda gunakan tidak memiliki label sentimen yang valid. Grafik distribusi sentimen tidak dapat dibuat.")
 
@@ -545,7 +552,10 @@ elif page == "Preprocessing":
             st.success("✅ Preprocessing selesai!")
             st.subheader("✅ Hasil Preprocessing Akhir")
             
-            st.dataframe(df_processed[['review_text', 'review_text_cleaned', 'review_text_tokens', 'review_text_tokens_WSW', 'review_text_normalized', 'review_text_normalizedjoin', 'category']].head())
+            cols_show = ['review_text', 'review_text_cleaned', 'review_text_tokens', 'review_text_tokens_WSW', 'review_text_normalized', 'review_text_normalizedjoin']
+            if 'category' in df_processed.columns:
+                cols_show.append('category')
+            st.dataframe(df_processed[cols_show].head())
 
             st.subheader("➡️ Distribusi Panjang Ulasan")
             df_processed['length_original'] = df_raw['review_text'].apply(lambda x: len(str(x).split()))
@@ -556,10 +566,10 @@ elif page == "Preprocessing":
             fig_hist.add_trace(go.Histogram(x=df_processed['length_preprocessed'], name='Panjang Setelah Preprocessing'))
             fig_hist.update_layout(barmode='overlay', title_text='Distribusi Panjang Ulasan', xaxis_title_text='Jumlah Kata', yaxis_title_text='Frekuensi')
             fig_hist.update_traces(opacity=0.75)
-            st.plotly_chart(fig_hist)
+            st.plotly_chart(fig_hist, use_container_width=True)
             
             corpus = " ".join(df_processed['review_text_normalizedjoin'])
-            if corpus:
+            if corpus.strip():
                 st.subheader("➡️ Word Cloud Kata Terpopuler")
                 wc = WordCloud(background_color="white", max_words=100).generate(corpus)
                 fig_wc, ax_wc = plt.subplots(figsize=(10,5))
@@ -573,13 +583,13 @@ elif page == "Preprocessing":
                 top_words = freqdist.most_common(20)
                 df_freq = pd.DataFrame(top_words, columns=['word','freq'])
                 fig2 = px.bar(df_freq, x='word', y='freq', title='20 Kata Paling Sering Muncul')
-                st.plotly_chart(fig2)
+                st.plotly_chart(fig2, use_container_width=True)
 
                 st.subheader("➡️ 15 Bigram Paling Sering Muncul")
                 df_bigrams = get_top_ngrams(corpus, n=2, top=15)
                 df_bigrams['Ngram'] = df_bigrams['Ngram'].apply(lambda x: ' '.join(x))
                 fig3 = px.bar(df_bigrams, x='Ngram', y='Frequency', title='15 Bigram Paling Sering Muncul')
-                st.plotly_chart(fig3)
+                st.plotly_chart(fig3, use_container_width=True)
             else:
                 st.warning("Tidak ada kata-kata yang tersisa setelah preprocessing. Visualisasi tidak dapat dibuat.")
 
@@ -642,14 +652,24 @@ elif page == "Modeling & Evaluasi":
 
                 if not y_true_filtered.empty:
                     st.subheader("🔢 Confusion Matrix")
-                    cm = confusion_matrix(y_true_filtered, y_pred_filtered)
-                    fig_cm = px.imshow(cm, x=list(LABEL_TO_INDEX.keys()), y=list(LABEL_TO_INDEX.keys()), text_auto=True,
-                                       labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
-                                       title="Confusion Matrix")
-                    st.plotly_chart(fig_cm)
+                    cm = confusion_matrix(y_true_filtered.astype(int), y_pred_filtered.astype(int))
+                    fig_cm = px.imshow(
+                        cm,
+                        x=list(LABEL_TO_INDEX.keys()),
+                        y=list(LABEL_TO_INDEX.keys()),
+                        text_auto=True,
+                        labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
+                        title="Confusion Matrix"
+                    )
+                    st.plotly_chart(fig_cm, use_container_width=True)
 
                     st.subheader("📝 Classification Report")
-                    report_dict = classification_report(y_true_filtered, y_pred_filtered, target_names=LABEL_TO_INDEX.keys(), output_dict=True)
+                    report_dict = classification_report(
+                        y_true_filtered.astype(int),
+                        y_pred_filtered.astype(int),
+                        target_names=list(LABEL_TO_INDEX.keys()),
+                        output_dict=True
+                    )
                     df_report = pd.DataFrame(report_dict).T
                     st.dataframe(df_report)
 
@@ -657,7 +677,7 @@ elif page == "Modeling & Evaluasi":
                     counts = df_eval_input['predicted_category'].value_counts()
                     fig_pie = px.pie(values=counts, names=counts.index, title='Proporsi Sentimen Prediksi',
                                      color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
-                    st.plotly_chart(fig_pie)
+                    st.plotly_chart(fig_pie, use_container_width=True)
                 else:
                     st.warning("Tidak ada data dengan label yang valid untuk evaluasi.")
     else:
@@ -700,13 +720,12 @@ elif page == "Prediksi":
             counts = df_to_predict['predicted_category'].value_counts()
             fig_pie = px.pie(values=counts, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
                              color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
-            st.plotly_chart(fig_pie)
+            st.plotly_chart(fig_pie, use_container_width=True)
             
             csv = df_to_predict.to_csv(index=False).encode('utf-8')
             st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing' untuk memulai prediksi batch.")
-
 
     st.subheader("Prediksi Ulasan Tunggal")
     user_input = st.text_area("Masukkan ulasan:", height=150)
