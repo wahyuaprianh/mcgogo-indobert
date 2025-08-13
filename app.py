@@ -685,32 +685,47 @@ elif page == "Prediksi":
     st.subheader("Prediksi dari Data yang Diproses")
     if 'df_preprocessed' in st.session_state and not st.session_state.df_preprocessed.empty:
         if st.button("Mulai Prediksi Batch", use_container_width=True):
-            df_to_predict = st.session_state.df_preprocessed.copy()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            predictions = []
-            confidence_scores = []
-            total = len(df_to_predict)
-            start_time = time.time()
+        df_to_predict = st.session_state.df_preprocessed.copy()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        predictions = []
+        confidence_scores = []
+        total = len(df_to_predict)
+        start_time = time.time()
+        
+        for idx, text in enumerate(df_to_predict['review_text_normalizedjoin']):
+            if not text or pd.isna(text):
+                predictions.append('unknown')
+                confidence_scores.append('N/A')
+                continue
+
+            enc = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
+            enc = {k: v.to(device) for k, v in enc.items()}
             
-            for idx, text in enumerate(df_to_predict['review_text_normalizedjoin']):
-                enc = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
-                enc = {k: v.to(device) for k, v in enc.items()}
-                with torch.no_grad():
-                    logits = model(**enc).logits
+            with torch.no_grad():
+                logits = model(**enc).logits
+            
+            # Tambahkan pengecekan validitas logit di sini
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                label_id = -1 # Atau nilai default lain
+                predictions.append('error')
+                confidence_scores.append('N/A')
+                st.warning(f"Logit tidak valid untuk review ke-{idx}. Menghasilkan NaN.")
+            else:
                 label_id = torch.argmax(logits, dim=-1).item()
-                conf = F.softmax(logits, dim=-1).squeeze()[label_id].item()*100
+                conf_tensor = F.softmax(logits, dim=-1)
+                conf = conf_tensor.squeeze()[label_id].item() * 100
                 predictions.append(INDEX_TO_LABEL[label_id])
                 confidence_scores.append(f"{conf:.2f}%")
-                
-                progress = (idx + 1) / total
-                status_text.text(f"Memproses data {idx+1}/{total} ({progress*100:.1f}%)")
-                progress_bar.progress(int(progress * 100))
 
-            df_to_predict['predicted_category'] = predictions
-            df_to_predict['confidence'] = confidence_scores
-            st.success("Prediksi batch selesai! ✅")
-            st.dataframe(df_to_predict[['review_text', 'predicted_category', 'confidence']].head())
+            progress = (idx + 1) / total
+            status_text.text(f"Memproses data {idx+1}/{total} ({progress*100:.1f}%)")
+            progress_bar.progress(int(progress * 100))
+
+        df_to_predict['predicted_category'] = predictions
+        df_to_predict['confidence'] = confidence_scores
+        st.success("Prediksi batch selesai! ✅")
+        st.dataframe(df_to_predict[['review_text', 'predicted_category', 'confidence']].head())
             
             st.subheader("🥧 Distribusi Sentimen Hasil Prediksi")
             counts = df_to_predict['predicted_category'].value_counts()
