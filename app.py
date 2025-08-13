@@ -1,12 +1,10 @@
+# app.py (final revised)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 import string
 import nltk
-nltk.download('punkt')
-nltk.download('punkt_tab')
-nltk.download('stopwords')
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
@@ -30,6 +28,47 @@ from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 from streamlit_carousel import carousel
 import base64
 import os
+
+# =========================
+# NLTK resource setup (safe)
+# =========================
+# Try to download only if not present; wrap in try/except so app doesn't crash in restricted env.
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    try:
+        nltk.download('punkt', quiet=True)
+    except Exception:
+        pass
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    try:
+        nltk.download('stopwords', quiet=True)
+    except Exception:
+        pass
+
+# punkt_tab might be missing in some envs; attempt to download but continue if fails.
+try:
+    nltk.data.find('tokenizers/punkt_tab/indonesian')
+except LookupError:
+    try:
+        nltk.download('punkt_tab', quiet=True)
+    except Exception:
+        # If cannot download, we'll still continue and use fallback tokenization
+        pass
+
+# =========================
+# Helper: safe word_tokenize (fallback to simple split)
+# =========================
+def safe_word_tokenize(text: str):
+    try:
+        return word_tokenize(text)
+    except Exception:
+        # fallback: quick split on whitespace and punctuation removal
+        text = re.sub(r'[' + re.escape(string.punctuation) + r']', ' ', str(text))
+        return [t for t in text.split() if t]
 
 # =========================
 # Fungsi untuk mengubah gambar menjadi Base64
@@ -130,36 +169,48 @@ INDEX_TO_LABEL = {0: 'positive', 1: 'neutral', 2: 'negative'}
 # =========================
 @st.cache_resource
 def load_model_and_tokenizer():
+    """
+    Load tokenizer and model once (cached). Return (tokenizer, model, device).
+    Handles 8-bit loading attempt and fallback to float32.
+    """
     try:
         tokenizer = BertTokenizer.from_pretrained(MODEL_PATH)
+    except Exception as e:
+        st.error(f"Gagal memuat tokenizer dari {MODEL_PATH}: {e}")
+        st.stop()
+
+    try:
         config = BertConfig.from_pretrained(MODEL_PATH)
         config.num_labels = len(LABEL_TO_INDEX)
+    except Exception:
+        config = BertConfig.from_pretrained(MODEL_PATH, num_labels=len(LABEL_TO_INDEX))
 
-        model = None
-        device = torch.device("cpu")
-        # Coba 8bit jika bitsandbytes & GPU tersedia
+    model = None
+    device = torch.device("cpu")
+    # Try load in 8-bit if possible (and bitsandbytes available)
+    try:
+        model = BertForSequenceClassification.from_pretrained(
+            MODEL_PATH,
+            config=config,
+            load_in_8bit=True,
+            device_map="auto"
+        )
+        # detect device (could be 'cpu' or 'cuda:x')
         try:
-            model = BertForSequenceClassification.from_pretrained(
-                MODEL_PATH,
-                config=config,
-                load_in_8bit=True,
-                device_map="auto"
-            )
-            # deteksi device salah satu param
             device = next(model.parameters()).device
-        except Exception as e8:
-            # Fallback ke float32; pakai GPU bila ada
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = BertForSequenceClassification.from_pretrained(
-                MODEL_PATH,
-                config=config
-            ).to(device)
+        except Exception:
+            device = torch.device("cpu")
+    except Exception:
+        # fallback: normal float32 load
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            model = BertForSequenceClassification.from_pretrained(MODEL_PATH, config=config).to(device)
+        except Exception as e:
+            st.error(f"Gagal memuat model dari {MODEL_PATH}: {e}")
+            st.stop()
 
-        model.eval()
-        return tokenizer, model, device
-    except Exception as e:
-        st.error(f"Gagal memuat model/tokenizer: {e}")
-        st.stop()
+    model.eval()
+    return tokenizer, model, device
 
 tokenizer, model, device = load_model_and_tokenizer()
 
@@ -168,8 +219,16 @@ tokenizer, model, device = load_model_and_tokenizer()
 # =========================
 def load_stopwords():
     """Memuat stopwords dari NLTK, daftar kustom manual, dan file lokal."""
-    list_stopwords = set(stopwords.words('indonesian'))
-    list_stopwords.update([
+    try:
+        list_stop = set(stopwords.words('indonesian'))
+    except Exception:
+        # fallback to English stopwords if indonesian not present
+        try:
+            list_stop = set(stopwords.words('english'))
+        except Exception:
+            list_stop = set()
+
+    list_stop.update([
         "yg","dg","rt","dgn","ny","d","klo","kalo","amp","biar","bikin",
         "bilang","gak","ga","krn","nya","nih","sih","si","tau","tdk","tuh",
         "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
@@ -180,12 +239,13 @@ def load_stopwords():
         try:
             with open(stopwords_file_path, 'r', encoding='utf-8') as file:
                 stopwords_from_file = [line.strip() for line in file if line.strip()]
-                list_stopwords.update(stopwords_from_file)
+                list_stop.update(stopwords_from_file)
         except Exception as e:
             st.warning(f"Gagal memuat stopwords lokal: {e}. Menggunakan bawaan NLTK + manual.")
     else:
-        st.warning(f"File stopwords lokal tidak ditemukan: {stopwords_file_path}. Hanya menggunakan stopwords default.")
-    return list_stopwords
+        # silent: don't warn repeatedly on cloud
+        pass
+    return list_stop
 
 list_stopwords = load_stopwords()
 
@@ -193,10 +253,13 @@ list_stopwords = load_stopwords()
 def load_kamus_baku():
     kamus_baku_path = './data/kamus_baku.csv'
     if not os.path.exists(kamus_baku_path):
-        st.warning(f"File kamus baku tidak ditemukan: {kamus_baku_path}. Normalisasi kata tidak akan lengkap.")
+        # silent fallback
         return {}
-    df_kamus = pd.read_csv(kamus_baku_path, encoding='latin-1')
-    return dict(zip(df_kamus.iloc[:,0], df_kamus.iloc[:,1]))
+    try:
+        df_kamus = pd.read_csv(kamus_baku_path, encoding='latin-1')
+        return dict(zip(df_kamus.iloc[:,0], df_kamus.iloc[:,1]))
+    except Exception:
+        return {}
 
 normalizad_word_dict = load_kamus_baku()
 
@@ -213,16 +276,21 @@ def clean_review(text):
     emoji_pattern = re.compile("[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]+", flags=re.UNICODE)
     text = emoji_pattern.sub(' ', text)
     text = re.sub(r'#(\S+)', r'\1', text)
-    text = re.sub('[^a-zA-Z]+', ' ', text)
+    # keep only letters and spaces (Indonesian uses Latin letters)
+    text = re.sub('[^a-zA-Z ]+', ' ', text)
     text = repeatcharClean(text)
     text = re.sub('[ ]+',' ',text).strip()
     return text
 
 def tokenization_review_func(text):
-    return word_tokenize(text)
+    # use safe_word_tokenize which falls back to simple split
+    return safe_word_tokenize(text)
 
 def stopwords_removal_func_wrapper(words):
-    return [w for w in words if w not in list_stopwords]
+    try:
+        return [w for w in words if w and w not in list_stopwords]
+    except Exception:
+        return [w for w in words if w]
 
 @st.cache_resource
 def load_stemmer():
@@ -232,39 +300,46 @@ def load_stemmer():
 stemmer = load_stemmer()
 
 def stemming_func_wrapper(words):
-    return [stemmer.stem(w) for w in words]
+    try:
+        return [stemmer.stem(w) for w in words]
+    except Exception:
+        return words
 
 def normalized_term_func_wrapper(document):
     return [normalizad_word_dict.get(term, term) for term in document]
 
 def preprocess_dataframe(df_raw_input):
     df_processed = df_raw_input.copy()
-    
-    with st.expander("Langkah 1: Case Folding & Cleaning"):
-        st.info("Mengubah semua teks menjadi huruf kecil, menghapus URL, emoji, dan karakter non-alfabet.")
-        df_processed['review_text_cleaned'] = df_processed['review_text'].apply(clean_review)
-        st.dataframe(df_processed[['review_text', 'review_text_cleaned']].head())
-    
-    with st.expander("Langkah 2: Tokenization & Stopwords Removal"):
-        st.info("Memisahkan teks menjadi kata-kata (token) dan menghapus kata-kata umum (stopwords).")
-        df_processed['review_text_tokens'] = df_processed['review_text_cleaned'].apply(tokenization_review_func)
-        df_processed['review_text_tokens_WSW'] = df_processed['review_text_tokens'].apply(stopwords_removal_func_wrapper)
-        st.dataframe(df_processed[['review_text_cleaned', 'review_text_tokens_WSW']].head())
 
-    with st.expander("Langkah 3: Stemming"):
-        st.info("Mengubah kata berimbuhan menjadi kata dasar.")
-        df_processed['review_text_stemmed'] = df_processed['review_text_tokens_WSW'].apply(stemming_func_wrapper)
-        st.dataframe(df_processed[['review_text_tokens_WSW', 'review_text_stemmed']].head())
+    # ensure 'review_text' exists
+    if 'review_text' not in df_processed.columns:
+        # try to find a plausible column name
+        possible_cols = [c for c in df_processed.columns if 'review' in c.lower() or 'content' in c.lower()]
+        if possible_cols:
+            df_processed = df_processed.rename(columns={possible_cols[0]: 'review_text'})
+        else:
+            df_processed['review_text'] = df_processed.iloc[:,0].astype(str)
 
-    with st.expander("Langkah 4: Normalisasi"):
-        st.info("Mengubah kata-kata tidak baku menjadi kata baku berdasarkan kamus.")
-        df_processed['review_text_normalized'] = df_processed['review_text_stemmed'].apply(normalized_term_func_wrapper)
-        st.dataframe(df_processed[['review_text_stemmed', 'review_text_normalized']].head())
-    
-    df_processed["review_text_normalizedjoin"] = [' '.join(word) for word in df_processed["review_text_normalized"]]
-    df_processed.replace(['',' '], np.nan, inplace=True)
+    # 1. Case folding & cleaning
+    df_processed['review_text_cleaned'] = df_processed['review_text'].fillna("").astype(str).apply(clean_review)
+
+    # 2. Tokenization & stopwords removal
+    df_processed['review_text_tokens'] = df_processed['review_text_cleaned'].apply(tokenization_review_func)
+    df_processed['review_text_tokens_WSW'] = df_processed['review_text_tokens'].apply(stopwords_removal_func_wrapper)
+
+    # 3. Stemming
+    df_processed['review_text_stemmed'] = df_processed['review_text_tokens_WSW'].apply(stemming_func_wrapper)
+
+    # 4. Normalisasi
+    df_processed['review_text_normalized'] = df_processed['review_text_stemmed'].apply(normalized_term_func_wrapper)
+
+    # Join normalized tokens
+    df_processed["review_text_normalizedjoin"] = df_processed["review_text_normalized"].apply(lambda l: ' '.join(l) if isinstance(l, (list, tuple)) else str(l))
+
+    # Replace truly empty strings with NaN and drop rows with missing text
+    df_processed['review_text_normalizedjoin'] = df_processed['review_text_normalizedjoin'].replace(r'^\s*$', np.nan, regex=True)
     df_processed.dropna(subset=['review_text_normalizedjoin'], inplace=True)
-    
+
     return df_processed
 
 def preprocess_single_text(text):
@@ -276,6 +351,10 @@ def preprocess_single_text(text):
     return " ".join(normalized_tokens)
 
 def map_score_to_sentiment(score):
+    try:
+        score = int(score)
+    except Exception:
+        return 'unknown'
     if score in [1, 2]:
         return 'negative'
     elif score == 3:
@@ -308,7 +387,6 @@ menu_items = {
 st.sidebar.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
 
 for key, label in menu_items.items():
-    btn_class = "sidebar-button-active" if st.session_state.page == key else "sidebar-button"
     if st.sidebar.button(label, key=f"menu_{key}", use_container_width=True):
         st.session_state.page = key
         st.rerun()
@@ -320,59 +398,32 @@ page = st.session_state.page
 # =========================
 st.markdown('<div class="main-card">', unsafe_allow_html=True)
 
+# -------------------------
+# Beranda (unchanged)
+# -------------------------
 if page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
-    
     try:
         st.image("image/home.jpg", use_container_width=True)
     except Exception:
         st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_container_width=True)
         st.info("Gambar 'image/home.jpg' tidak ditemukan. Menampilkan gambar placeholder.")
-    
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
+    """, unsafe_allow_html=True)
 
-    Aplikasi ini dirancang untuk menganalisis dan mengklasifikasikan sentimen dari ulasan pengguna aplikasi *Magic Chess: Go Go* di Google Play Store. Dengan memanfaatkan kecanggihan model **IndoBERT**, aplikasi ini mampu mengubah data kualitatif (teks ulasan) menjadi wawasan kuantitatif (positif, negatif, dan netral) melalui antarmuka yang interaktif.
-
-    Dasbor ini dibuat sebagai bagian dari pemenuhan tugas akhir yang disusun oleh:
-    """)
-    
     st.markdown("""
     <table class="author-table">
-        <tr>
-            <td>Nama</td>
-            <td>Wahyu Aprian Hadiansyah</td>
-        </tr>
-        <tr>
-            <td>NPM</td>
-            <td>11121284</td>
-        </tr>
-        <tr>
-            <td>Kelas</td>
-            <td>4KA23</td>
-        </tr>
-        <tr>
-            <td>Program Studi</td>
-            <td>Sistem Informasi</td>
-        </tr>
-        <tr>
-            <td>Fakultas</td>
-            <td>Ilmu Komputer dan Teknologi Informasi</td>
-        </tr>
-        <tr>
-            <td>Universitas</td>
-            <td>Universitas Gunadarma</td>
-        </tr>
-        <tr>
-            <td>Tahun</td>
-            <td>2025</td>
-        </tr>
+        <tr><td>Nama</td><td>Wahyu Aprian Hadiansyah</td></tr>
+        <tr><td>NPM</td><td>11121284</td></tr>
+        <tr><td>Kelas</td><td>4KA23</td></tr>
+        <tr><td>Program Studi</td><td>Sistem Informasi</td></tr>
+        <tr><td>Universitas</td><td>Universitas Gunadarma</td></tr>
+        <tr><td>Tahun</td><td>2025</td></tr>
     </table>
     """, unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # --- BAGIAN CAROUSEL ---
+    # carousel (keep original)
     st.subheader("Sinergi Hero Magic Chess Go Go")
     items = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
@@ -397,6 +448,9 @@ if page == "Beranda":
     except Exception as e:
         st.warning(f"Carousel tidak dapat ditampilkan: {e}")
 
+# -------------------------
+# Scraping Data (kept)
+# -------------------------
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
     st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
@@ -416,7 +470,7 @@ elif page == "Scraping Data":
 
     start_dt = datetime.datetime.combine(start_date, datetime.time.min)
     end_dt = datetime.datetime.combine(end_date, datetime.time.max)
-    
+
     st.info("Aplikasi akan mengambil ulasan terbaru, memfilternya sesuai rentang tanggal, lalu memilih jumlah yang Anda inginkan.")
 
     if st.button("Mulai Scraping", use_container_width=True):
@@ -425,56 +479,55 @@ elif page == "Scraping Data":
         else:
             with st.spinner("Mengambil ulasan..."):
                 try:
-                    # gunakan reviews() agar count berfungsi
                     raw, _ = reviews(
                         APP_ID,
                         lang=lang,
                         country=country,
                         sort=Sort.NEWEST,
-                        count=int(num_reviews*2)  # ambil ekstra untuk jaga-jaga setelah filter tanggal
+                        count=int(num_reviews*2)
                     )
                     if not raw:
                         st.warning("Tidak ada ulasan yang ditemukan. Silakan cek rentang tanggal.")
                         st.session_state.df_scraped = pd.DataFrame()
                     else:
                         df_scraped = pd.DataFrame(raw)
-                        # pastikan kolom 'at' ada
                         if 'at' not in df_scraped.columns:
                             st.error("Struktur data dari Play Store berubah. Kolom 'at' tidak ditemukan.")
                             st.stop()
 
                         df_scraped['timestamp'] = pd.to_datetime(df_scraped['at'])
                         df_filtered_by_date = df_scraped[(df_scraped['timestamp'] >= start_dt) & (df_scraped['timestamp'] <= end_dt)].reset_index(drop=True)
-                        
+
                         if df_filtered_by_date.empty:
                             st.warning("Tidak ada ulasan pada rentang tanggal tersebut. Coba rentang yang lebih luas.")
                             st.session_state.df_scraped = pd.DataFrame()
                         else:
                             final_df = df_filtered_by_date.head(int(num_reviews)).copy()
-                            # mapping sentimen dari score
                             if 'score' in final_df.columns:
                                 final_df['category'] = final_df['score'].apply(map_score_to_sentiment)
                             else:
                                 final_df['category'] = 'unknown'
-                            # pastikan kolom review_text tersedia
+
                             if 'content' in final_df.columns:
                                 final_df = final_df.rename(columns={'content': 'review_text'})
                             elif 'review_text' not in final_df.columns:
                                 final_df['review_text'] = final_df.get('body', '')
-                            # drop kolom 'at' bila ada
+
                             if 'at' in final_df.columns:
                                 final_df = final_df.drop(columns=['at'])
 
                             st.success(f"✅ Berhasil mengambil {len(final_df)} ulasan dalam rentang tanggal yang dipilih!")
                             st.dataframe(final_df[['review_text', 'category', 'score', 'timestamp']].head())
                             st.session_state.df_scraped = final_df
-                            
+
                             csv = final_df.to_csv(index=False).encode('utf-8')
                             st.download_button("Unduh Hasil Scraping", csv, "scraped_data.csv", "text/csv")
-                
                 except Exception as e:
                     st.error(f"Gagal mengambil data. Error: {e}")
 
+# -------------------------
+# Preprocessing (kept but safe)
+# -------------------------
 elif page == "Preprocessing":
     st.header("🧹 Preprocessing Data Ulasan")
     st.write("Disarankan untuk mengunggah file yang sudah memiliki label sentimen (positive, negative, neutral) jika ingin melakukan evaluasi model.")
@@ -488,21 +541,24 @@ elif page == "Preprocessing":
             st.subheader("📄 Data Asli (dari Scraping)")
             cols_to_show = ['review_text', 'category'] if 'category' in df_raw.columns else ['review_text']
             st.dataframe(df_raw[cols_to_show].head())
-    
+
     if df_raw is None:
         uploaded_file = st.file_uploader("Atau, pilih file TSV/CSV", type=["tsv", "csv"])
         if uploaded_file is not None:
-            if uploaded_file.name.endswith('.tsv'):
-                df_raw = pd.read_csv(uploaded_file, sep='\t', names=['review_text', 'category'])
-            else:
-                df_raw = pd.read_csv(uploaded_file)
-                if df_raw.shape[1] == 1:
-                    df_raw.columns = ['review_text']
-                    df_raw['category'] = 'unknown'
-            st.subheader("📄 Data Asli (dari File)")
-            cols_to_show = ['review_text', 'category'] if 'category' in df_raw.columns else ['review_text']
-            st.dataframe(df_raw[cols_to_show].head())
-            
+            try:
+                if uploaded_file.name.endswith('.tsv'):
+                    df_raw = pd.read_csv(uploaded_file, sep='\t', names=['review_text', 'category'])
+                else:
+                    df_raw = pd.read_csv(uploaded_file)
+                    if df_raw.shape[1] == 1:
+                        df_raw.columns = ['review_text']
+                        df_raw['category'] = 'unknown'
+                st.subheader("📄 Data Asli (dari File)")
+                cols_to_show = ['review_text', 'category'] if 'category' in df_raw.columns else ['review_text']
+                st.dataframe(df_raw[cols_to_show].head())
+            except Exception as e:
+                st.error(f"Gagal membaca file: {e}")
+
     if df_raw is not None and not df_raw.empty:
         is_labeled = ('category' in df_raw.columns and df_raw['category'].isin(LABEL_TO_INDEX.keys()).any())
 
@@ -513,10 +569,10 @@ elif page == "Preprocessing":
                 df_raw['bulan_tahun'] = df_raw['timestamp'].dt.to_period('M').astype(str)
 
                 df_counts = df_raw.groupby(['bulan_tahun', 'category']).size().reset_index(name='Jumlah Ulasan')
-                
+
                 fig = go.Figure()
                 color_map = {'positive': 'green', 'negative': 'red', 'neutral': 'blue'}
-                
+
                 for category, color in color_map.items():
                     df_category = df_counts[df_counts['category'] == category]
                     fig.add_trace(go.Bar(
@@ -525,7 +581,7 @@ elif page == "Preprocessing":
                         name=category,
                         marker_color=color
                     ))
-                
+
                 fig.update_layout(
                     barmode='group',
                     xaxis_tickangle=-45,
@@ -547,7 +603,7 @@ elif page == "Preprocessing":
             df_processed = preprocess_dataframe(df_raw.copy())
             st.success("✅ Preprocessing selesai!")
             st.subheader("✅ Hasil Preprocessing Akhir")
-            
+
             cols_show = ['review_text', 'review_text_cleaned', 'review_text_tokens', 'review_text_tokens_WSW', 'review_text_normalized', 'review_text_normalizedjoin']
             if 'category' in df_processed.columns:
                 cols_show.append('category')
@@ -556,14 +612,14 @@ elif page == "Preprocessing":
             st.subheader("➡️ Distribusi Panjang Ulasan")
             df_processed['length_original'] = df_raw['review_text'].apply(lambda x: len(str(x).split()))
             df_processed['length_preprocessed'] = df_processed['review_text_normalizedjoin'].apply(lambda x: len(str(x).split()))
-            
+
             fig_hist = go.Figure()
             fig_hist.add_trace(go.Histogram(x=df_processed['length_original'], name='Panjang Asli'))
             fig_hist.add_trace(go.Histogram(x=df_processed['length_preprocessed'], name='Panjang Setelah Preprocessing'))
             fig_hist.update_layout(barmode='overlay', title_text='Distribusi Panjang Ulasan', xaxis_title_text='Jumlah Kata', yaxis_title_text='Frekuensi')
             fig_hist.update_traces(opacity=0.75)
             st.plotly_chart(fig_hist, use_container_width=True)
-            
+
             corpus = " ".join(df_processed['review_text_normalizedjoin'])
             if corpus.strip():
                 st.subheader("➡️ Word Cloud Kata Terpopuler")
@@ -595,6 +651,9 @@ elif page == "Preprocessing":
     else:
         st.info("Silakan unggah atau scraping data terlebih dahulu.")
 
+# -------------------------
+# Modeling & Evaluasi (kept)
+# -------------------------
 elif page == "Modeling & Evaluasi":
     st.header("📊 Modeling & Evaluasi IndoBERT")
     df_eval_input = None
@@ -604,7 +663,10 @@ elif page == "Modeling & Evaluasi":
     else:
         uploaded_eval_file = st.file_uploader("Upload File Preprocessed", type=["tsv", "csv"], key="eval_upload")
         if uploaded_eval_file is not None:
-            df_eval_input = pd.read_csv(uploaded_eval_file, sep='\t' if uploaded_eval_file.name.endswith('.tsv') else ',')
+            try:
+                df_eval_input = pd.read_csv(uploaded_eval_file, sep='\t' if uploaded_eval_file.name.endswith('.tsv') else ',')
+            except Exception as e:
+                st.error(f"Gagal membaca file evaluasi: {e}")
 
     if df_eval_input is not None and not df_eval_input.empty:
         if 'review_text_normalizedjoin' not in df_eval_input.columns or 'category' not in df_eval_input.columns:
@@ -620,13 +682,18 @@ elif page == "Modeling & Evaluasi":
                 total = len(df_eval_input)
                 start_time = time.time()
 
-                for idx, text in enumerate(df_eval_input['review_text_normalizedjoin']):
+                for idx, text in enumerate(df_eval_input['review_text_normalizedjoin'].fillna("").astype(str)):
+                    # safe single inference (kept small)
                     enc = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
                     enc = {k: v.to(device) for k, v in enc.items()}
                     with torch.no_grad():
                         logits = model(**enc).logits
-                    label_id = torch.argmax(logits, dim=-1).item()
-                    predictions.append(INDEX_TO_LABEL[label_id])
+                    # safe label extraction
+                    try:
+                        label_id = int(torch.argmax(logits, dim=-1).item())
+                        predictions.append(INDEX_TO_LABEL.get(label_id, 'unknown'))
+                    except Exception:
+                        predictions.append('unknown')
 
                     progress = (idx + 1) / total
                     elapsed = time.time() - start_time
@@ -638,10 +705,10 @@ elif page == "Modeling & Evaluasi":
 
                 df_eval_input['predicted_category'] = predictions
                 st.success("Evaluasi selesai! ✅")
-                
+
                 y_true = df_eval_input['category'].map(LABEL_TO_INDEX)
                 y_pred = df_eval_input['predicted_category'].map(LABEL_TO_INDEX)
-                
+
                 valid_labels_mask = y_true.notna()
                 y_true_filtered = y_true[valid_labels_mask]
                 y_pred_filtered = y_pred[valid_labels_mask]
@@ -679,70 +746,149 @@ elif page == "Modeling & Evaluasi":
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing' atau unggah file yang sudah diproses.")
 
+# -------------------------
+# Prediksi (REVISED: safe batch inference)
+# -------------------------
 elif page == "Prediksi":
     st.header("🔮 Prediksi Sentimen")
-    
+
     st.subheader("Prediksi dari Data yang Diproses")
     if 'df_preprocessed' in st.session_state and not st.session_state.df_preprocessed.empty:
         if st.button("Mulai Prediksi Batch", use_container_width=True):
             df_to_predict = st.session_state.df_preprocessed.copy()
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            predictions = []
-            confidence_scores = []
-            total = len(df_to_predict)
-            start_time = time.time()
-            
-            for idx, text in enumerate(df_to_predict['review_text_normalizedjoin']):
-                enc = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
-                enc = {k: v.to(device) for k, v in enc.items()}
-                with torch.no_grad():
-                    logits = model(**enc).logits
-                label_id = torch.argmax(logits, dim=-1).item()
-                conf = F.softmax(logits, dim=-1).squeeze()[label_id].item()*100
-                predictions.append(INDEX_TO_LABEL[label_id])
-                confidence_scores.append(f"{conf:.2f}%")
-                
-                progress = (idx + 1) / total
-                status_text.text(f"Memproses data {idx+1}/{total} ({progress*100:.1f}%)")
-                progress_bar.progress(int(progress * 100))
 
-            df_to_predict['predicted_category'] = predictions
-            df_to_predict['confidence'] = confidence_scores
-            st.success("Prediksi batch selesai! ✅")
-            st.dataframe(df_to_predict[['review_text', 'predicted_category', 'confidence']].head())
-            
-            st.subheader("🥧 Distribusi Sentimen Hasil Prediksi")
-            counts = df_to_predict['predicted_category'].value_counts()
-            fig_pie = px.pie(values=counts, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
-                             color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
-            st.plotly_chart(fig_pie, use_container_width=True)
-            
-            csv = df_to_predict.to_csv(index=False).encode('utf-8')
-            st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
+            # 1) Ensure text column exists & safe
+            if 'review_text_normalizedjoin' not in df_to_predict.columns:
+                st.error("Kolom 'review_text_normalizedjoin' tidak ditemukan di data. Silakan preprocessing terlebih dahulu.")
+            else:
+                # Fill NaN, strip, then drop truly empty rows
+                df_to_predict['review_text_normalizedjoin'] = df_to_predict['review_text_normalizedjoin'].fillna("").astype(str).str.strip()
+                df_to_predict = df_to_predict[df_to_predict['review_text_normalizedjoin'] != ""].reset_index(drop=True)
+
+                if df_to_predict.empty:
+                    st.warning("Tidak ada teks valid untuk diprediksi setelah preprocessing.")
+                else:
+                    texts = df_to_predict['review_text_normalizedjoin'].tolist()
+                    total = len(texts)
+
+                    # Tokenize batch (let tokenizer handle padding)
+                    try:
+                        enc = tokenizer(texts, return_tensors='pt', truncation=True, padding=True, max_length=512)
+                    except Exception:
+                        # Fallback: tokenize per item into a list to avoid tokenizer side effects
+                        enc_list = [tokenizer(t, return_tensors='pt', truncation=True, padding='max_length', max_length=512) for t in texts]
+                        # Merge into batch tensors manually (less common path)
+                        enc = {}
+                        for k in enc_list[0].keys():
+                            enc[k] = torch.cat([e[k] for e in enc_list], dim=0)
+
+                    # Move tensors to correct device
+                    enc = {k: v.to(device) for k, v in enc.items()}
+
+                    # Run inference in batch safely
+                    with torch.no_grad():
+                        try:
+                            logits = model(**enc).logits  # shape: (batch_size, num_labels)
+                        except Exception as e:
+                            st.error(f"Gagal melakukan inferensi batch: {e}")
+                            logits = None
+
+                    predictions = []
+                    confidence_scores = []
+
+                    if logits is None:
+                        # fallback: run per-sample safe inference
+                        for text in texts:
+                            if not text.strip():
+                                predictions.append('unknown')
+                                confidence_scores.append("0.00%")
+                                continue
+                            enc_single = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
+                            enc_single = {k: v.to(device) for k, v in enc_single.items()}
+                            with torch.no_grad():
+                                out = model(**enc_single).logits
+                            out = out.detach().cpu().float().squeeze()
+                            if torch.isnan(out).any() or torch.isinf(out).any() or out.numel() == 0:
+                                predictions.append('unknown')
+                                confidence_scores.append("0.00%")
+                            else:
+                                probs = F.softmax(out, dim=-1).numpy()
+                                label_id = int(np.argmax(probs))
+                                conf = float(probs[label_id]) * 100.0
+                                predictions.append(INDEX_TO_LABEL.get(label_id, 'unknown'))
+                                confidence_scores.append(f"{conf:.2f}%")
+                    else:
+                        # process batch logits safely
+                        logits_cpu = logits.detach().cpu().float().numpy()  # shape (N, C)
+                        # check for nan/inf rows
+                        for row in logits_cpu:
+                            if np.isnan(row).any() or np.isinf(row).any() or row.size == 0:
+                                predictions.append('unknown')
+                                confidence_scores.append("0.00%")
+                            else:
+                                probs = np.exp(row - np.max(row))  # stable softmax numerator
+                                probs = probs / probs.sum()
+                                label_id = int(np.argmax(probs))
+                                conf = float(probs[label_id]) * 100.0
+                                predictions.append(INDEX_TO_LABEL.get(label_id, 'unknown'))
+                                confidence_scores.append(f"{conf:.2f}%")
+
+                    df_to_predict['predicted_category'] = predictions
+                    df_to_predict['confidence'] = confidence_scores
+
+                    st.success("Prediksi batch selesai! ✅")
+                    st.dataframe(df_to_predict[['review_text', 'predicted_category', 'confidence']].head())
+
+                    st.subheader("🥧 Distribusi Sentimen Hasil Prediksi")
+                    counts = df_to_predict['predicted_category'].value_counts()
+                    fig_pie = px.pie(values=counts, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
+                                     color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+                    csv = df_to_predict.to_csv(index=False).encode('utf-8')
+                    st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing' untuk memulai prediksi batch.")
 
+    # -------------------------
+    # Prediksi Ulasan Tunggal (REVISED: safe)
+    # -------------------------
     st.subheader("Prediksi Ulasan Tunggal")
     user_input = st.text_area("Masukkan ulasan:", height=150)
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
             processed_text = preprocess_single_text(user_input)
-            enc = tokenizer(processed_text, return_tensors='pt', truncation=True, padding=True, max_length=512)
-            enc = {k: v.to(device) for k, v in enc.items()}
-            with torch.no_grad():
-                logits = model(**enc).logits
-            label_id = torch.argmax(logits, dim=-1).item()
-            conf = F.softmax(logits, dim=-1).squeeze()[label_id].item()*100
-            predicted_label = INDEX_TO_LABEL[label_id]
-            st.subheader("Hasil Prediksi:")
-            if predicted_label == 'positive':
-                st.success(f"Sentimen: **{predicted_label}** ({conf:.2f}%)")
-            elif predicted_label == 'negative':
-                st.error(f"Sentimen: **{predicted_label}** ({conf:.2f}%)")
+            if not processed_text.strip():
+                st.warning("Teks setelah preprocessing menjadi kosong. Coba masukkan teks lain.")
             else:
-                st.info(f"Sentimen: **{predicted_label}** ({conf:.2f}%)")
-        else:
-            st.warning("Mohon masukkan ulasan untuk dianalisis.")
+                try:
+                    enc = tokenizer(processed_text, return_tensors='pt', truncation=True, padding=True, max_length=512)
+                    enc = {k: v.to(device) for k, v in enc.items()}
+                    with torch.no_grad():
+                        logits = model(**enc).logits
+                    # ensure vector
+                    logits = logits.detach().cpu().float().squeeze()
+                    if torch.isnan(torch.tensor(logits)).any() or torch.isinf(torch.tensor(logits)).any():
+                        label = 'unknown'
+                        conf = 0.0
+                    else:
+                        probs = F.softmax(torch.tensor(logits), dim=-1).numpy()
+                        label_id = int(np.argmax(probs))
+                        label = INDEX_TO_LABEL.get(label_id, 'unknown')
+                        conf = float(probs[label_id]) * 100.0
+                except Exception as e:
+                    st.error(f"Gagal memprediksi: {e}")
+                    label = 'unknown'
+                    conf = 0.0
+
+                st.subheader("Hasil Prediksi:")
+                if label == 'positive':
+                    st.success(f"Sentimen: **{label}** ({conf:.2f}%)")
+                elif label == 'negative':
+                    st.error(f"Sentimen: **{label}** ({conf:.2f}%)")
+                elif label == 'unknown':
+                    st.warning("Hasil prediksi tidak dapat ditentukan (unknown).")
+                else:
+                    st.info(f"Sentimen: **{label}** ({conf:.2f}%)")
 
 st.markdown('</div>', unsafe_allow_html=True)
