@@ -4,26 +4,9 @@ import numpy as np
 import re
 import string
 import nltk
-@st.cache_resource
-def setup_nltk():
-    """Unduh resource NLTK yang dibutuhkan."""
-    # List resource yang wajib ada
-    resources = [
-        'punkt',        # model sentence tokenizer
-        'punkt_tab',    # tabel tambahan tokenizer untuk bahasa non-Inggris
-        'stopwords'     # stopword list
-    ]
-
-    for resource in resources:
-        try:
-            nltk.data.find(f'tokenizers/{resource}') if 'punkt' in resource else nltk.data.find(f'corpora/{resource}')
-        except LookupError:
-            nltk.download(resource)
-
-    print("NLTK resources are ready.")  # Pesan untuk debugging di logs
-
-# Panggil fungsi setup ini di awal eksekusi aplikasi
-setup_nltk()
+nltk.download('punkt')
+nltk.download('punkt_tab')
+nltk.download('stopwords')
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
