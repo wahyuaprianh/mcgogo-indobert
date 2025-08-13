@@ -685,13 +685,13 @@ elif page == "Prediksi":
     st.subheader("Prediksi dari Data yang Diproses")
     if 'df_preprocessed' in st.session_state and not st.session_state.df_preprocessed.empty:
         if st.button("Mulai Prediksi Batch", use_container_width=True):
-        df_to_predict = st.session_state.df_preprocessed.copy()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        predictions = []
-        confidence_scores = []
-        total = len(df_to_predict)
-        start_time = time.time()
+            df_to_predict = st.session_state.df_preprocessed.copy()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            predictions = []
+            confidence_scores = []
+            total = len(df_to_predict)
+            start_time = time.time()
         
         for idx, text in enumerate(df_to_predict['review_text_normalizedjoin']):
             if not text or pd.isna(text):
