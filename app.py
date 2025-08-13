@@ -4,8 +4,20 @@ import numpy as np
 import re
 import string
 import nltk
-nltk.download('punkt')
-nltk.download('stopwords')
+@st.cache_resource
+def setup_nltk():
+    """Unduh resource NLTK yang dibutuhkan."""
+    # Cek dulu untuk menghindari unduhan berulang yang tidak perlu
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('punkt')
+        nltk.download('stopwords')
+    print("NLTK resources are ready.") # Pesan untuk debugging di logs
+
+# Panggil fungsi setup ini di awal eksekusi aplikasi
+setup_nltk()
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
