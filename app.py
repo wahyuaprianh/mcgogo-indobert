@@ -727,11 +727,11 @@ elif page == "Prediksi":
         st.success("Prediksi batch selesai! ✅")
         st.dataframe(df_to_predict[['review_text', 'predicted_category', 'confidence']].head())
             
-            st.subheader("🥧 Distribusi Sentimen Hasil Prediksi")
-            counts = df_to_predict['predicted_category'].value_counts()
-            fig_pie = px.pie(values=counts, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
-                             color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
-            st.plotly_chart(fig_pie, use_container_width=True)
+        st.subheader("🥧 Distribusi Sentimen Hasil Prediksi")
+        counts = df_to_predict['predicted_category'].value_counts()
+        fig_pie = px.pie(values=counts, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
+                         color_discrete_map={'positive': 'green', 'negative': 'red', 'neutral': 'blue'})
+        st.plotly_chart(fig_pie, use_container_width=True)
             
             csv = df_to_predict.to_csv(index=False).encode('utf-8')
             st.download_button("Unduh Hasil Prediksi", csv, "predicted_data.csv", "text/csv", use_container_width=True)
