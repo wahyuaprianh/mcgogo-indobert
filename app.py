@@ -4,13 +4,8 @@ import numpy as np
 import re
 import string
 import nltk
-# Unduh resource NLTK secara senyap (sekali saja)
-for pkg in ["punkt", "stopwords"]:
-    try:
-        nltk.data.find(f"tokenizers/{pkg}" if pkg == "punkt" else f"corpora/{pkg}")
-    except LookupError:
-        nltk.download(pkg, quiet=True)
-
+nltk.download('punkt')
+nltk.download('stopwords')
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from nltk.probability import FreqDist
