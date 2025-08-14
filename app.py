@@ -1,4 +1,10 @@
-# app.py (FINAL FAST + robust loader CPU/GPU + 8bit-aware)
+# app.py — FINAL (Secrets-aware, Remote-first optional)
+# - Baca secrets via st.secrets (fallback os.environ)
+# - CPU override pakai MODEL_ID_CPU_OVERRIDE (FP32)
+# - Opsional: REMOTE_URL + REMOTE_TOKEN untuk inference via GPU endpoint
+# - Label map dinamis + override via LABEL_MAP
+# - Fitur: scraping, preprocessing, evaluasi, prediksi batch & single
+
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
@@ -10,8 +16,28 @@ import plotly.express as px
 import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
+import requests
 
-# ==== CPU threading tuning ====
+# ---------------- Secrets helper ----------------
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        v = st.secrets.get(name)
+        if v is not None:
+            return str(v)
+    except Exception:
+        pass
+    return os.getenv(name, default) or default
+
+# ================== ENV (REMOTE/LOCAL) ==================
+REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
+REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
+USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
+
+MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
+MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
+LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
+
+# ================== Threading & Perf ==================
 try:
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, min(os.cpu_count() or 1, 4)))
@@ -26,7 +52,7 @@ except Exception:
     pass
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
-# NLTK & Preproc
+# ================== NLP utils ==================
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import ToktokTokenizer
@@ -35,7 +61,7 @@ from nltk import ngrams
 from wordcloud import WordCloud
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
-# HF
+# ================== HF Transformers ==================
 from transformers import (
     BertTokenizer,
     BertForSequenceClassification,
@@ -43,31 +69,23 @@ from transformers import (
 )
 from sklearn.metrics import confusion_matrix, classification_report
 
-# Scraper
+# ================== Scraper & UI ==================
 from google_play_scraper import Sort, reviews
-
-# Carousel
 from streamlit_carousel import carousel
 
 # ========= App Config =========
 st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go Go Menggunakan IndoBERT")
-
-MODEL_ID = os.getenv("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
-# Optional override untuk CPU (model FP32 kamu)
-MODEL_ID_CPU_OVERRIDE = os.getenv("MODEL_ID_CPU_OVERRIDE", "").strip() or None
 APP_ID = "com.mobilechess.gp"
 
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
-LABELS = ['positive','neutral','negative']
-LABEL2ID_DEFAULT = {k:i for i,k in enumerate(LABELS)}
-ID2LABEL_DEFAULT = {i:k for k,i in LABEL2ID_DEFAULT.items()}
+DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
+DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # urutan untuk chart
 
 # ========= UI Helpers =========
 @st.cache_data
 def get_image_as_base64(path: str):
-    if not os.path.exists(path):
-        return None
+    if not os.path.exists(path): return None
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
@@ -107,12 +125,10 @@ ensure_nltk()
 @st.cache_data
 def load_stopwords():
     sw = set(stopwords.words('indonesian'))
-    sw.update([
-        "yg","dg","rt","dgn","ny","d","klo","kalo","amp","biar","bikin",
-        "bilang","gak","ga","krn","nya","nih","sih","si","tau","tdk","tuh",
-        "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
-        "nan","loh","yah","dr","gw","gue"
-    ])
+    sw.update(["yg","dg","rt","dgn","ny","d","klo","kalo","amp","biar","bikin",
+               "bilang","gak","ga","krn","nya","nih","sih","si","tau","tdk","tuh",
+               "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
+               "nan","loh","yah","dr","gw","gue"])
     path = './data/stopwords_id.txt'
     if os.path.exists(path):
         try:
@@ -192,7 +208,6 @@ def preprocess_dataframe(df_raw_input: pd.DataFrame) -> pd.DataFrame:
         progress_bar = st.progress(0)
         status_text = st.empty()
         t0 = time.time()
-
         stemmed_out = []
         for i, tokens in enumerate(tokens_series, start=1):
             stemmed_out.append([_stem_cached(w) for w in tokens])
@@ -202,7 +217,6 @@ def preprocess_dataframe(df_raw_input: pd.DataFrame) -> pd.DataFrame:
                 eta = (elapsed / i) * (total - i) if i > 0 else 0
                 status_text.text(f"Stemming {i}/{total} ({p*100:.1f}%) | ETA: {datetime.timedelta(seconds=int(eta))}")
                 progress_bar.progress(int(p * 100))
-
         df['review_text_stemmed'] = stemmed_out
         st.dataframe(df[['review_text_tokens_WSW','review_text_stemmed']].head())
 
@@ -251,19 +265,13 @@ def fetch_reviews_by_date(
     token: Optional[Tuple] = None
     prog = st.progress(0) if show_progress else None
     info = st.empty() if show_progress else None
-
     for page in range(max_pages):
         batch, token = reviews(
-            app_id,
-            lang=lang,
-            country=country,
-            sort=Sort.NEWEST,
-            count=page_size,
-            continuation_token=token,
+            app_id, lang=lang, country=country, sort=Sort.NEWEST,
+            count=page_size, continuation_token=token,
         )
         if not batch:
             break
-
         all_rows.extend(batch)
         if show_progress:
             pct = int(min(100, (page + 1) / max_pages * 100))
@@ -271,7 +279,6 @@ def fetch_reviews_by_date(
             last_dt = batch[-1].get("at")
             if isinstance(last_dt, datetime.datetime):
                 info.text(f"Halaman {page+1}/{max_pages} | Oldest in batch: {last_dt}")
-
         last_at = batch[-1].get("at")
         if isinstance(last_at, datetime.datetime) and last_at.tzinfo is not None:
             last_at = last_at.astimezone(datetime.timezone.utc).replace(tzinfo=None)
@@ -279,28 +286,20 @@ def fetch_reviews_by_date(
             break
         if token is None:
             break
-
-    if show_progress and prog:
-        prog.progress(100)
-
-    if not all_rows:
-        return pd.DataFrame()
-
+    if show_progress and prog: prog.progress(100)
+    if not all_rows: return pd.DataFrame()
     df = pd.DataFrame(all_rows)
     ts = pd.to_datetime(df["at"], errors="coerce", utc=True)
     df["timestamp"] = ts.dt.tz_convert("UTC").dt.tz_localize(None)
     df = df[(df["timestamp"] >= start_dt) & (df["timestamp"] <= end_dt)].reset_index(drop=True)
-
     if "content" in df.columns and "review_text" not in df.columns:
         df = df.rename(columns={"content": "review_text"})
     if "review_text" not in df.columns:
         df["review_text"] = df.get("body", "")
-
     if "score" in df.columns:
         df["category"] = df["score"].apply(map_score_to_sentiment)
     else:
         df["category"] = "unknown"
-
     if "reviewId" in df.columns:
         df = df.drop_duplicates("reviewId")
     if "at" in df.columns:
@@ -316,159 +315,133 @@ def _standardize_label(lbl: str) -> str:
     if l in VALID_LABELS:   return l
     return l
 
+def _norm_lbl(x: str) -> str:
+    x = (x or "").strip().lower()
+    aliases = {"pos":"positive","positive":"positive","neg":"negative","negative":"negative","neu":"neutral","neutral":"neutral"}
+    return aliases.get(x, x)
+
 # ========= Runtime params by mode =========
 def get_runtime_params(mode: str, device: torch.device):
     if mode == "Akurasi Tinggi":
-        max_len = 512
-        batch_size = 16 if device.type == "cpu" else 64
-        use_quant = False
-    else:  # Cepat (disarankan)
-        max_len = 256
-        batch_size = 64 if device.type == "cpu" else 128
-        use_quant = True if device.type == "cpu" else False
+        max_len = 512; batch_size = 16 if device.type == "cpu" else 64; use_quant = False
+    else:
+        max_len = 256; batch_size = 64 if device.type == "cpu" else 128; use_quant = True if device.type == "cpu" else False
     return max_len, batch_size, use_quant
 
-# ========= Robust Model Loader (handles 8-bit repo on CPU) =========
-@st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
-    use_cuda = torch.cuda.is_available()
+# ========= Remote predict =========
+def remote_predict_batch(texts: List[str], return_conf: bool = False):
+    payload = {"inputs": [preprocess_for_model(t) for t in texts]}
+    headers = {"Authorization": f"Bearer {REMOTE_TOKEN}"}
+    r = requests.post(REMOTE_URL, json=payload, headers=headers, timeout=120)
+    r.raise_for_status()
+    out = r.json()
+    preds, confs = [], []
+    if isinstance(out, dict): raise RuntimeError(out.get("error","Remote error"))
+    if len(texts) == 1 and isinstance(out, list) and out and isinstance(out[0], dict):
+        out = [out]
+    for per_text in out:
+        if not per_text: preds.append("neutral"); confs.append(0.0); continue
+        best = max(per_text, key=lambda x: x.get("score", 0.0))
+        lbl = _norm_lbl(best.get("label", "neutral"))
+        preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
+    return (preds, confs) if return_conf else preds
 
-    # Build candidate list untuk CPU fallback
+# ========= Local Loader (dipakai jika USE_REMOTE=False) =========
+@st.cache_resource
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 6):
+    use_cuda = torch.cuda.is_available()
     cpu_candidates = []
     if MODEL_ID_CPU_OVERRIDE:
         cpu_candidates.append(MODEL_ID_CPU_OVERRIDE)
     if "8bit" in MODEL_ID.lower():
-        for suf in ["fp32", "full", "float32"]:
+        for suf in ["fp32","full","float32"]:
             cpu_candidates.append(MODEL_ID.replace("8bit", suf))
-    # base IndoBERT (last resort, head 3 label akan diinit random)
     cpu_candidates += ["indobenchmark/indobert-base-p1", "indolem/indobert-base-uncased"]
 
-    model = None
-    device = None
-    final_model_id = MODEL_ID
-    loaded_bnb_8bit = False
+    model = None; device = None; final_model_id = MODEL_ID; loaded_bnb_8bit = False
 
     if use_cuda:
-        # Prefer 8-bit di GPU
         try:
-            model = BertForSequenceClassification.from_pretrained(
-                MODEL_ID, load_in_8bit=True, device_map="auto"
-            )
-            device = next(model.parameters()).device
-            final_model_id = MODEL_ID
-            loaded_bnb_8bit = True
+            model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto")
+            device = next(model.parameters()).device; loaded_bnb_8bit = True; final_model_id = MODEL_ID
         except Exception:
-            # fallback ke FP32 di CUDA (jika repo mendukung)
             try:
                 cfg = AutoConfig.from_pretrained(MODEL_ID)
                 if hasattr(cfg, "quantization_config"):
                     try: delattr(cfg, "quantization_config")
-                    except Exception: pass
+                    except: pass
                     try: cfg.__dict__.pop("quantization_config", None)
-                    except Exception: pass
+                    except: pass
                 model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
-                device = torch.device("cuda")
-                model.to(device)
-                final_model_id = MODEL_ID
+                device = torch.device("cuda"); model.to(device); final_model_id = MODEL_ID
             except Exception:
-                # terakhir: pakai base IndoBERT di CUDA
                 base_id = "indobenchmark/indobert-base-p1"
                 cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
                 model = BertForSequenceClassification.from_pretrained(base_id, config=cfg)
-                device = torch.device("cuda")
-                model.to(device)
-                final_model_id = base_id
+                device = torch.device("cuda"); model.to(device); final_model_id = base_id
     else:
-        # CPU path: jangan pakai repo 8-bit; coba kandidat FP32
-        load_err = None
         for cand in cpu_candidates:
             try:
                 cfg = AutoConfig.from_pretrained(cand)
-                # pastikan tak ada jejak quantization_config
                 if hasattr(cfg, "quantization_config"):
                     try: delattr(cfg, "quantization_config")
-                    except Exception: pass
+                    except: pass
                     try: cfg.__dict__.pop("quantization_config", None)
-                    except Exception: pass
-                # pastikan 3 label
-                if getattr(cfg, "num_labels", None) != 3:
-                    cfg.num_labels = 3
-                model = BertForSequenceClassification.from_pretrained(
-                    cand, config=cfg, torch_dtype=torch.float32
-                )
-                device = torch.device("cpu")
-                model.to(device)
-                model.float()
-                final_model_id = cand
-                load_err = None
+                    except: pass
+                if getattr(cfg, "num_labels", None) != 3: cfg.num_labels = 3
+                model = BertForSequenceClassification.from_pretrained(cand, config=cfg, torch_dtype=torch.float32)
+                device = torch.device("cpu"); model.to(device); model.float(); final_model_id = cand
                 break
-            except Exception as e:
-                load_err = e
+            except Exception:
                 continue
         if model is None:
-            # Last resort: base IndoBERT FP32 di CPU
             base_id = "indobenchmark/indobert-base-p1"
             cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
-            model = BertForSequenceClassification.from_pretrained(
-                base_id, config=cfg, torch_dtype=torch.float32
-            )
-            device = torch.device("cpu")
-            model.to(device)
-            model.float()
-            final_model_id = base_id
+            model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, torch_dtype=torch.float32)
+            device = torch.device("cpu"); model.to(device); model.float(); final_model_id = base_id
 
-    # Quantization CPU opsional (bukan bnb)
+    # Quantize CPU (torchao) optional
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
-            quantize_(model, int8_dynamic())  # in-place
+            quantize_(model, int8_dynamic())
         except Exception:
             import warnings
             with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="torch.ao.quantization is deprecated",
-                    category=DeprecationWarning,
-                )
+                warnings.filterwarnings("ignore", message="torch.ao.quantization is deprecated", category=DeprecationWarning)
                 try:
-                    model = torch.quantization.quantize_dynamic(
-                        model, {torch.nn.Linear}, dtype=torch.qint8
-                    )
+                    model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
                 except Exception:
                     pass
 
     model.eval()
 
-    # Tokenizer harus match dengan final_model_id
+    # Tokenizer
     try:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id)
 
-    # Sinkronisasi label map ke 3 kelas standar
-    cfg2 = model.config
-    need_fix_map = (
-        getattr(cfg2, "num_labels", None) != 3
-        or any(lbl not in {'positive','neutral','negative'} for lbl in getattr(cfg2, "id2label", {}).values())
-    )
-    if need_fix_map:
-        cfg2.num_labels = 3
-        cfg2.id2label = ID2LABEL_DEFAULT.copy()
-        cfg2.label2id = LABEL2ID_DEFAULT.copy()
-        try:
-            model.config = cfg2
-        except Exception:
-            pass
+    # Label map dari config
+    try:
+        id2label = {int(k): _standardize_label(v) for k,v in model.config.id2label.items()}
+        label2id = {v:k for k,v in id2label.items()}
+        if len(id2label) != getattr(model.config, "num_labels", 3): raise KeyError
+    except Exception:
+        id2label = DEFAULT_ID2LABEL.copy(); label2id = {v:k for k,v in id2label.items()}
 
-    # Pastikan mapping rapi
-    id2label = {int(k): _standardize_label(v) for k, v in getattr(model.config, "id2label", ID2LABEL_DEFAULT).items()} if isinstance(getattr(model.config, "id2label", {}), dict) else ID2LABEL_DEFAULT
-    label2id = {_standardize_label(k): int(v) for k, v in getattr(model.config, "label2id", LABEL2ID_DEFAULT).items()} if isinstance(getattr(model.config, "label2id", {}), dict) else LABEL2ID_DEFAULT
+    # Override dari LABEL_MAP
+    override = LABEL_MAP_RAW
+    if override:
+        for pair in override.split(","):
+            i, name = pair.split(":", 1)
+            id2label[int(i)] = _standardize_label(name)
+        label2id = {v:k for k,v in id2label.items()}
 
-    # Info kecil di sidebar
     with st.sidebar.expander("⚙ Model Info", expanded=False):
+        st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
-        st.write(f"8-bit bnb: `{loaded_bnb_8bit}`")
 
     return tokenizer, model, device, id2label, label2id
 
@@ -477,93 +450,65 @@ if "page" not in st.session_state:
     st.session_state.page = "Beranda"
 
 st.sidebar.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
-for key, label in {
-    "Beranda": "🏠 Beranda",
-    "Scraping Data": "📥 Scraping Data",
-    "Preprocessing": "🧹 Preprocessing",
-    "Modeling & Evaluasi": "📊 Modeling & Evaluasi",
-    "Prediksi": "🔮 Prediksi",
-}.items():
+for key, label in {"Beranda":"🏠 Beranda","Scraping Data":"📥 Scraping Data","Preprocessing":"🧹 Preprocessing","Modeling & Evaluasi":"📊 Modeling & Evaluasi","Prediksi":"🔮 Prediksi"}.items():
     if st.sidebar.button(label, key=f"menu_{key}", use_container_width=True):
-        st.session_state.page = key
-        st.rerun()
+        st.session_state.page = key; st.rerun()
 
-mode_choice = st.sidebar.radio(
-    "Mode Inference",
+mode_choice = st.sidebar.radio("Mode Inference",
     options=["Cepat (disarankan)", "Akurasi Tinggi"],
     help="Cepat: MAX_LEN=256, batching besar, quantization CPU.\nAkurasi Tinggi: MAX_LEN=512, tanpa quantization."
 )
 
-_tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
+# ========= Load model/tokenizer (skip kalau remote) =========
+if USE_REMOTE:
+    device = torch.device("cpu")
+    ID2LABEL = DEFAULT_ID2LABEL.copy()
+    if LABEL_MAP_RAW:
+        for pair in LABEL_MAP_RAW.split(","):
+            i, name = pair.split(":",1)
+            ID2LABEL[int(i)] = _standardize_label(name)
+    LABEL2ID = {v:k for k,v in ID2LABEL.items()}
+    tokenizer = None; model = None
+else:
+    _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
+    tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(quantize=use_quant_tmp, _v=6)
 
-# Bust cache via _v jika perlu (ubah angkanya kalau loader kamu edit lagi)
-tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-    quantize=use_quant_tmp, _v=4
-)
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
-
 page = st.session_state.page
 
-# ========= FAST Prediction utils =========
-def preencode_texts(texts: List[str]):
-    cleaned = [preprocess_for_model(t) for t in texts]
-    enc = tokenizer(
-        cleaned, return_tensors='pt', truncation=True, padding=True,
-        max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None)
-    )
-    return enc
-
-def predict_from_preencoded(enc_all, batch_size=BATCH_SIZE, return_conf=False):
-    preds, confs = [], []
-    total = enc_all["input_ids"].shape[0]
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch = {k: v[start:end].to(device, non_blocking=True) for k, v in enc_all.items()}
-        with torch.inference_mode():
-            if device.type == "cuda":
-                with torch.autocast('cuda', dtype=torch.float16):
-                    logits = model(**batch).logits
-            else:
-                logits = model(**batch).logits
-            if return_conf:
-                probs = F.softmax(logits, dim=-1)
-                pred_ids = probs.argmax(dim=-1).tolist()
-                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
-                confs.extend((probs.max(dim=-1).values * 100).tolist())
-            else:
-                pred_ids = logits.argmax(dim=-1).tolist()
-                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
-    return (preds, confs) if return_conf else preds
-
+# ========= Prediksi utility =========
 def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return_conf: bool = False):
-    """Tokenize per-batch (dynamic padding) + throttled UI."""
+    if USE_REMOTE:
+        preds, confs = [], []
+        prog = st.progress(0); info = st.empty()
+        N = len(texts); processed = 0
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            p, c = remote_predict_batch(texts[start:end], return_conf=True)
+            preds.extend(p); confs.extend(c)
+            processed += (end - start)
+            prog.progress(int(processed / N * 100))
+            info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
+        return (preds, confs) if return_conf else preds
+
     preds, confs = [], []
     prog = st.progress(0); info = st.empty()
-    N = len(texts)
-    processed = 0
-    last_ui = time.time()
-
+    N = len(texts); processed = 0; last_ui = time.time()
     for start in range(0, N, batch_size):
         end = min(start + batch_size, N)
         batch_texts = [preprocess_for_model(t) for t in texts[start:end]]
         enc = tokenizer(
-            batch_texts,
-            return_tensors='pt',
-            truncation=True,
-            padding=True,
-            max_length=MAX_LEN,
-            pad_to_multiple_of=(8 if device.type != "cpu" else None),
+            batch_texts, return_tensors='pt', truncation=True, padding=True,
+            max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None),
         )
         enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
-
         with torch.inference_mode():
             if device.type == "cuda":
                 with torch.autocast('cuda', dtype=torch.float16):
                     logits = model(**enc).logits
             else:
                 logits = model(**enc).logits
-
             if return_conf:
                 probs = F.softmax(logits, dim=-1)
                 pred_ids = probs.argmax(dim=-1).tolist()
@@ -572,13 +517,11 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             else:
                 pred_ids = logits.argmax(dim=-1).tolist()
                 preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
-
         processed += (end - start)
         if time.time() - last_ui > 0.25:
             prog.progress(int(processed / N * 100))
             info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
             last_ui = time.time()
-
     prog.progress(100)
     return (preds, confs) if return_conf else preds
 
@@ -591,11 +534,9 @@ if page == "Beranda":
         st.image("image/home.jpg", use_container_width=True)
     except Exception:
         st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_container_width=True)
-        st.info("Gambar 'image/home.jpg' tidak ditemukan. Menampilkan placeholder.")
-
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
-    Aplikasi ini memanfaatkan **IndoBERT** untuk mengklasifikasikan sentimen ulasan pengguna (positif, netral, negatif).
+    Aplikasi ini memanfaatkan **IndoBERT** untuk mengklasifikasikan sentimen ulasan pengguna.
     """)
     st.markdown("""
     <table class="author-table">
@@ -617,11 +558,9 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/eruditio.jpg"},
         {"title": "", "text": "", "img": "image/nature spirit.jpg"},
         {"title": "", "text": "", "img": "image/emberlord.jpg"},
-        {"title": "", "text": "", "img": "image/eruditio.jpg"},
         {"title": "", "text": "", "img": "image/exorcist.jpg"},
         {"title": "", "text": "", "img": "image/faeborn.jpg"},
         {"title": "", "text": "", "img": "image/los pecados.jpg"},
-        {"title": "", "text": "", "img": "image/nature spirit.jpg"},
         {"title": "", "text": "", "img": "image/necrokeep.jpg"},
         {"title": "", "text": "", "img": "image/northen vale.jpg"},
         {"title": "", "text": "", "img": "image/shadeweaver.jpg"},
@@ -636,7 +575,6 @@ if page == "Beranda":
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
     st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
-
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Tanggal Mulai", datetime.date.today() - datetime.timedelta(days=30))
@@ -646,39 +584,29 @@ elif page == "Scraping Data":
         end_date = st.date_input("Tanggal Selesai", datetime.date.today())
         lang = st.selectbox("Bahasa", options=['id','en'], index=0)
         country = st.selectbox("Negara", options=['id','us'], index=0)
-
     start_dt = datetime.datetime.combine(start_date, datetime.time.min)
     end_dt   = datetime.datetime.combine(end_date,   datetime.time.max)
-
     if mode_scrape == "By rentang tanggal (disarankan)":
         with st.expander("⚙️ Opsi Lanjutan (Mode Tanggal)"):
             page_size = st.slider("Ukuran batch per halaman", 100, 250, 200, step=10)
             max_pages = st.slider("Maksimal halaman untuk dijelajahi", 10, 1000, 200, step=10)
-
     if st.button("Mulai Scraping", use_container_width=True):
         with st.spinner("Mengambil ulasan..."):
             try:
                 if mode_scrape == "By rentang tanggal (disarankan)":
-                    df = fetch_reviews_by_date(
-                        APP_ID, start_dt, end_dt,
-                        lang=lang, country=country,
-                        page_size=page_size, max_pages=max_pages, show_progress=True
-                    )
+                    df = fetch_reviews_by_date(APP_ID, start_dt, end_dt, lang=lang, country=country, page_size=page_size, max_pages=max_pages, show_progress=True)
                     if df.empty:
-                        st.error("Tidak ada ulasan pada rentang tanggal tersebut setelah menjelajah halaman yang ditentukan.")
-                        st.info("Perbesar 'Maksimal halaman' atau lebarkan rentang tanggal, lalu coba lagi.")
+                        st.error("Tidak ada ulasan pada rentang tanggal tersebut.")
                         st.session_state.df_scraped = pd.DataFrame()
                     else:
-                        st.success(f"✅ Berhasil mengambil {len(df)} ulasan di rentang tanggal.")
+                        st.success(f"✅ Berhasil mengambil {len(df)} ulasan.")
                         st.dataframe(df[['review_text','category','score','timestamp']].head())
                         st.session_state.df_scraped = df
-                        st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'),
-                                           "scraped_data.csv", "text/csv")
+                        st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'), "scraped_data.csv", "text/csv")
                 else:
                     raw, _ = reviews(APP_ID, lang=lang, country=country, sort=Sort.NEWEST, count=int(num_reviews))
                     if not raw:
-                        st.warning("Tidak ada ulasan ditemukan.")
-                        st.session_state.df_scraped = pd.DataFrame()
+                        st.warning("Tidak ada ulasan ditemukan."); st.session_state.df_scraped = pd.DataFrame()
                     else:
                         df = pd.DataFrame(raw)
                         if 'at' not in df.columns:
@@ -686,39 +614,29 @@ elif page == "Scraping Data":
                         ts = pd.to_datetime(df['at'], errors='coerce', utc=True)
                         df['timestamp'] = ts.dt.tz_convert('UTC').dt.tz_localize(None)
                         df = df[(df['timestamp'] >= start_dt) & (df['timestamp'] <= end_dt)].reset_index(drop=True)
-
                         if df.empty:
-                            ts_min = ts.min().tz_convert('UTC').tz_localize(None) if hasattr(ts, "dt") else None
-                            ts_max = ts.max().tz_convert('UTC').tz_localize(None) if hasattr(ts, "dt") else None
                             st.error("Tidak ada ulasan pada rentang ini dari batch terbaru.")
-                            if ts_min is not None and ts_max is not None:
-                                st.info(f"Rentang waktu batch: {ts_min} s/d {ts_max}. Pakai mode 'By rentang tanggal'.")
                             st.session_state.df_scraped = pd.DataFrame()
                         else:
                             df['category'] = df.get('score', np.nan).apply(map_score_to_sentiment)
                             if 'content' in df.columns: df = df.rename(columns={'content':'review_text'})
                             elif 'review_text' not in df.columns: df['review_text'] = df.get('body', '')
                             if 'at' in df.columns: df = df.drop(columns=['at'])
-
                             st.success(f"✅ Berhasil mengambil {len(df)} ulasan dari batch terbaru.")
                             st.dataframe(df[['review_text','category','score','timestamp']].head())
                             st.session_state.df_scraped = df
-                            st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'),
-                                               "scraped_data.csv", "text/csv")
+                            st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'), "scraped_data.csv", "text/csv")
             except Exception as e:
                 st.error(f"Gagal mengambil data: {e}")
 
 elif page == "Preprocessing":
     st.header("🧹 Preprocessing Data Ulasan")
-
     df_raw = None
     if 'df_scraped' in st.session_state and not getattr(st.session_state, "df_scraped", pd.DataFrame()).empty:
         if st.checkbox("Gunakan data hasil scraping", value=True):
             df_raw = st.session_state.df_scraped
             cols = ['review_text','category'] if 'category' in df_raw.columns else ['review_text']
-            st.subheader("📄 Data Asli (Scraping)")
-            st.dataframe(df_raw[cols].head())
-
+            st.subheader("📄 Data Asli (Scraping)"); st.dataframe(df_raw[cols].head())
     if df_raw is None:
         up = st.file_uploader("Atau unggah TSV/CSV", type=["tsv","csv"])
         if up is not None:
@@ -731,63 +649,44 @@ elif page == "Preprocessing":
             st.subheader("📄 Data Asli (File)")
             cols = ['review_text','category'] if 'category' in df_raw.columns else ['review_text']
             st.dataframe(df_raw[cols].head())
-
     if df_raw is not None and not df_raw.empty:
         if 'category' in df_raw.columns:
             tmp = df_raw[df_raw['category'].isin(VALID_LABELS)]
             if not tmp.empty:
                 st.subheader("➡️ Distribusi Sentimen Data Asli (label valid)")
-                counts = tmp['category'].value_counts().reindex(['positive','neutral','negative']).fillna(0)
+                counts = tmp['category'].value_counts().reindex(DEFAULT_LABEL_ORDER).fillna(0)
                 fig = px.bar(x=counts.index, y=counts.values, labels={'x':'category','y':'count'},
                              title='Distribusi Sentimen Data Asli', color=counts.index, color_discrete_map=COLOR_MAP)
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-
+                fig.update_layout(showlegend=False); st.plotly_chart(fig, use_container_width=True)
         if st.button("🚀 Mulai Preprocessing", use_container_width=True):
-            dfp = preprocess_dataframe(df_raw.copy())
-            st.success("✅ Preprocessing selesai!")
-            cols_show = [
-                'review_text','review_text_cleaned','review_text_tokens','review_text_tokens_WSW',
-                'review_text_stemmed','review_text_normalized','review_text_normalizedjoin'
-            ]
+            dfp = preprocess_dataframe(df_raw.copy()); st.success("✅ Preprocessing selesai!")
+            cols_show = ['review_text','review_text_cleaned','review_text_tokens','review_text_tokens_WSW',
+                         'review_text_stemmed','review_text_normalized','review_text_normalizedjoin']
             if 'category' in dfp.columns: cols_show.append('category')
             st.dataframe(dfp[cols_show].head())
-
             st.subheader("➡️ Distribusi Panjang Ulasan")
-            dfp['length_original'] = df_raw['review_text'].astype(str).apply(lambda s: len(s.split()))
+            dfp['length_original']   = df_raw['review_text'].astype(str).apply(lambda s: len(s.split()))
             dfp['length_preprocessed'] = dfp['review_text_normalizedjoin'].astype(str).apply(lambda s: len(s.split()))
             fig_hist = go.Figure()
             fig_hist.add_trace(go.Histogram(x=dfp['length_original'], name='Asli'))
             fig_hist.add_trace(go.Histogram(x=dfp['length_preprocessed'], name='Preprocessed'))
             fig_hist.update_layout(barmode='overlay', title='Distribusi Panjang Ulasan',
                                    xaxis_title='Jumlah Kata', yaxis_title='Frekuensi')
-            fig_hist.update_traces(opacity=0.75)
-            st.plotly_chart(fig_hist, use_container_width=True)
-
+            fig_hist.update_traces(opacity=0.75); st.plotly_chart(fig_hist, use_container_width=True)
             corpus = " ".join(dfp['review_text_normalizedjoin'].astype(str))
             if corpus.strip():
                 st.subheader("➡️ Word Cloud Kata Terpopuler")
                 wc = WordCloud(background_color="white", max_words=100).generate(corpus)
-                fig_wc, ax_wc = plt.subplots(figsize=(10,5))
-                ax_wc.imshow(wc, interpolation="bilinear"); ax_wc.axis("off")
+                fig_wc, ax_wc = plt.subplots(figsize=(10,5)); ax_wc.imshow(wc, interpolation="bilinear"); ax_wc.axis("off")
                 st.pyplot(fig_wc)
-
                 st.subheader("➡️ 20 Kata Paling Sering Muncul")
                 tokens = sum((t for t in dfp['review_text_normalized'] if isinstance(t, list)), [])
-                freqdist = FreqDist(tokens)
-                top_words = freqdist.most_common(20)
-                df_freq = pd.DataFrame(top_words, columns=['word','freq'])
-                st.plotly_chart(px.bar(df_freq, x='word', y='freq', title='20 Kata Paling Sering Muncul'),
-                                use_container_width=True)
-
+                freqdist = FreqDist(tokens); df_freq = pd.DataFrame(freqdist.most_common(20), columns=['word','freq'])
+                st.plotly_chart(px.bar(df_freq, x='word', y='freq', title='20 Kata Paling Sering Muncul'), use_container_width=True)
                 st.subheader("➡️ 15 Bigram Paling Sering Muncul")
                 df_bi = get_top_ngrams(corpus, n=2, top=15); df_bi['Ngram'] = df_bi['Ngram'].apply(lambda x: ' '.join(x))
-                st.plotly_chart(px.bar(df_bi, x='Ngram', y='Frequency', title='15 Bigram Paling Sering Muncul'),
-                                use_container_width=True)
-
-            st.download_button("💾 Download Hasil Preprocessing",
-                               dfp.to_csv(index=False).encode('utf-8'),
-                               "preprocessed.csv", "text/csv", use_container_width=True)
+                st.plotly_chart(px.bar(df_bi, x='Ngram', y='Frequency', title='15 Bigram Paling Sering Muncul'), use_container_width=True)
+            st.download_button("💾 Download Hasil Preprocessing", dfp.to_csv(index=False).encode('utf-8'), "preprocessed.csv", "text/csv", use_container_width=True)
             st.session_state.df_preprocessed = dfp
     else:
         st.info("Silakan unggah atau scraping data terlebih dahulu.")
@@ -796,13 +695,11 @@ elif page == "Modeling & Evaluasi":
     st.header("📊 Modeling & Evaluasi IndoBERT")
     df_eval = None
     if 'df_preprocessed' in st.session_state:
-        df_eval = st.session_state.df_preprocessed
-        st.write("Menggunakan data hasil preprocessing.")
+        df_eval = st.session_state.df_preprocessed; st.write("Menggunakan data hasil preprocessing.")
     else:
         up = st.file_uploader("Upload File Preprocessed / Raw", type=["tsv","csv"], key="eval_upload")
         if up is not None:
             df_eval = pd.read_csv(up, sep='\t' if up.name.endswith('.tsv') else ',')
-
     if df_eval is not None and not df_eval.empty:
         if 'review_text' not in df_eval.columns or 'category' not in df_eval.columns:
             st.error("File harus memiliki kolom 'review_text' dan 'category'.")
@@ -812,92 +709,69 @@ elif page == "Modeling & Evaluasi":
                 st.warning("Tidak ada baris dengan label valid untuk evaluasi.")
             else:
                 st.dataframe(df_eval.head())
-
                 if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
                     texts = df_eval['review_text'].astype(str).tolist()
-
-                    with st.spinner("Inferensi cepat (dynamic padding per-batch)..."):
+                    with st.spinner("Inferensi cepat..."):
                         preds = predict_texts_dynamic(texts, batch_size=BATCH_SIZE, return_conf=False)
-
-                    df_eval['predicted_category'] = preds
-                    st.success("Evaluasi selesai! ✅")
-
-                    y_true = df_eval['category'].map(LABEL2ID).astype(int).to_numpy()
-                    y_pred = df_eval['predicted_category'].map(LABEL2ID).astype(int).to_numpy()
-
-                    order_names = ['positive','neutral','negative']
-                    order_ids = [LABEL2ID.get(n, i) for i, n in enumerate(order_names)]
-
+                    df_eval['predicted_category'] = preds; st.success("Evaluasi selesai! ✅")
+                    order_names = DEFAULT_LABEL_ORDER
+                    y_true = df_eval['category'].str.lower().tolist()
+                    y_pred = df_eval['predicted_category'].str.lower().tolist()
                     st.subheader("🔢 Confusion Matrix")
-                    cm = confusion_matrix(y_true, y_pred, labels=order_ids)
-                    fig_cm = px.imshow(
-                        cm, x=order_names, y=order_names, text_auto=True,
-                        labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
-                        title="Confusion Matrix"
-                    )
+                    cm = confusion_matrix(y_true, y_pred, labels=order_names)
+                    fig_cm = px.imshow(cm, x=order_names, y=order_names, text_auto=True,
+                                       labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
+                                       title="Confusion Matrix")
                     st.plotly_chart(fig_cm, use_container_width=True)
-
                     st.subheader("📝 Classification Report")
-                    report = classification_report(
-                        y_true, y_pred, target_names=order_names, output_dict=True, zero_division=0
-                    )
+                    report = classification_report(y_true, y_pred, labels=order_names, target_names=order_names, output_dict=True, zero_division=0)
                     st.dataframe(pd.DataFrame(report).T)
-
                     st.subheader("🥧 Proporsi Sentimen Prediksi")
-                    counts = df_eval['predicted_category'].value_counts().reindex(order_names).fillna(0)
-                    fig_pie = px.pie(values=counts.values, names=counts.index, title='Proporsi Sentimen Prediksi',
-                                     color=counts.index, color_discrete_map=COLOR_MAP)
-                    st.plotly_chart(fig_pie, use_container_width=True)
+                    counts = pd.Series(y_pred).value_counts().reindex(order_names).fillna(0)
+                    st.plotly_chart(px.pie(values=counts.values, names=counts.index, title='Proporsi Sentimen Prediksi',
+                                           color=counts.index, color_discrete_map=COLOR_MAP), use_container_width=True)
     else:
         st.info("Silakan proses data di 'Preprocessing' atau unggah file yang sudah diproses.")
 
 elif page == "Prediksi":
     st.header("🔮 Prediksi Sentimen")
-
     st.subheader("Prediksi dari Data yang Diproses")
     if 'df_preprocessed' in st.session_state and not st.session_state.df_preprocessed.empty:
         if st.button("Mulai Prediksi Batch", use_container_width=True):
             dfp = st.session_state.df_preprocessed.copy()
             texts = dfp['review_text'].astype(str).tolist()
-
-            with st.spinner("Inferensi cepat (dynamic padding per-batch, beserta confidence)..."):
+            with st.spinner("Inferensi cepat (beserta confidence)..."):
                 preds, confs = predict_texts_dynamic(texts, batch_size=BATCH_SIZE, return_conf=True)
-
-            dfp['predicted_category'] = preds
-            dfp['confidence'] = [f"{c:.2f}%" for c in confs]
+            dfp['predicted_category'] = preds; dfp['confidence'] = [f"{c:.2f}%" for c in confs]
             st.success("Prediksi batch selesai! ✅")
             st.dataframe(dfp[['review_text','predicted_category','confidence']].head())
-
-            counts = dfp['predicted_category'].value_counts().reindex(['positive','neutral','negative']).fillna(0)
-            fig_pie = px.pie(values=counts.values, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
-                             color=counts.index, color_discrete_map=COLOR_MAP)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-            st.download_button("Unduh Hasil Prediksi",
-                               dfp.to_csv(index=False).encode('utf-8'),
-                               "predicted_data.csv", "text/csv", use_container_width=True)
+            counts = dfp['predicted_category'].value_counts().reindex(DEFAULT_LABEL_ORDER).fillna(0)
+            st.plotly_chart(px.pie(values=counts.values, names=counts.index, title='Distribusi Sentimen Hasil Prediksi',
+                                   color=counts.index, color_discrete_map=COLOR_MAP), use_container_width=True)
+            st.download_button("Unduh Hasil Prediksi", dfp.to_csv(index=False).encode('utf-8'), "predicted_data.csv", "text/csv", use_container_width=True)
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing'.")
-
     st.subheader("Prediksi Ulasan Tunggal")
     user_input = st.text_area("Masukkan ulasan:", height=150)
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
-            text_for_model = preprocess_for_model(user_input)
-            enc = tokenizer(
-                text_for_model, return_tensors='pt', truncation=True, padding=True,
-                max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None)
-            )
-            enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
-            with torch.inference_mode():
-                if device.type == "cuda":
-                    with torch.autocast('cuda', dtype=torch.float16):
+            if USE_REMOTE:
+                preds, confs = remote_predict_batch([user_input], return_conf=True)
+                predicted, conf = preds[0], confs[0]
+            else:
+                text_for_model = preprocess_for_model(user_input)
+                enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True,
+                                max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None))
+                enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+                with torch.inference_mode():
+                    if device.type == "cuda":
+                        with torch.autocast('cuda', dtype=torch.float16):
+                            logits = model(**enc).logits
+                    else:
                         logits = model(**enc).logits
-                else:
-                    logits = model(**enc).logits
-                probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
-                lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
-            predicted = ID2LABEL.get(lid, "unknown")
+                    probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
+                    lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
+                    predicted = ID2LABEL.get(lid, "unknown")
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
