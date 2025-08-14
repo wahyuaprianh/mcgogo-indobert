@@ -1,9 +1,8 @@
-# app.py — FINAL (Secrets-aware + patched loader + debug panel)
-# - Baca secrets via st.secrets (fallback os.environ)
-# - MODEL_ID_CPU_OVERRIDE untuk paksa model FP32 di CPU
-# - Opsional REMOTE_URL + REMOTE_TOKEN (endpoint GPU)
-# - Opsional HF_TOKEN (kalau repo HF private)
-# - Panel debug untuk melihat secrets & catatan error loader
+# app.py — FINAL (Strict override + Secrets-aware + debug panel)
+# - Pakai MODEL_ID_CPU_OVERRIDE (FP32) dari Secrets untuk CPU. Jika gagal load, tampilkan error & stop (tidak fallback).
+# - Opsional REMOTE_URL + REMOTE_TOKEN untuk inference endpoint (jika ingin pakai GPU remote).
+# - Opsional HF_TOKEN untuk akses repo private di Hugging Face.
+# - Halaman: Beranda, Scraping Data, Preprocessing, Modeling & Evaluasi, Prediksi.
 
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
@@ -37,7 +36,7 @@ REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
 REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
 USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 
-HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo private
+HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
 AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
 # ================== Threading & Perf ==================
@@ -358,65 +357,90 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
-# ========= Loader (patched) =========
+# ========= Loader (STRICT OVERRIDE) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 7):
-    use_cuda = torch.cuda.is_available()
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 8):
+    from transformers import BertTokenizer, BertForSequenceClassification, AutoConfig
 
-    cpu_candidates = []
-    if MODEL_ID_CPU_OVERRIDE:
-        cpu_candidates.append(MODEL_ID_CPU_OVERRIDE)
-    if "8bit" in MODEL_ID.lower():
-        for suf in ["fp32","full","float32"]:
-            cpu_candidates.append(MODEL_ID.replace("8bit", suf))
-    cpu_candidates += ["indobenchmark/indobert-base-p1", "indolem/indobert-base-uncased"]
-
-    model = None; device = None; final_model_id = MODEL_ID; loaded_bnb_8bit = False
     errors = []
+    use_cuda = torch.cuda.is_available()
+    loaded_bnb_8bit = False
+    tokenizer = None
+    model = None
+    device = None
+    final_model_id = None
 
-    if use_cuda:
+    # 1) PRIORITAS: pakai MODEL_ID_CPU_OVERRIDE apa pun yang terjadi
+    if MODEL_ID_CPU_OVERRIDE:
         try:
-            model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH)
-            device = next(model.parameters()).device; loaded_bnb_8bit = True; final_model_id = MODEL_ID
+            cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH)
+            # buang jejak quantization di config kalau ada
+            if hasattr(cfg, "quantization_config"):
+                try: delattr(cfg, "quantization_config")
+                except: pass
+                try: cfg.__dict__.pop("quantization_config", None)
+                except: pass
+            if getattr(cfg, "num_labels", None) != 3:
+                cfg.num_labels = 3
+
+            # CPU path (Streamlit Cloud)
+            model = BertForSequenceClassification.from_pretrained(
+                MODEL_ID_CPU_OVERRIDE, config=cfg, torch_dtype=torch.float32, **AUTH
+            )
+            device = torch.device("cpu")
+            model.to(device)
+            model.float()
+            final_model_id = MODEL_ID_CPU_OVERRIDE
+
         except Exception as e:
-            errors.append(f"cuda 8bit load failed: {e}")
+            errors.append(f"OVERRIDE load failed for {MODEL_ID_CPU_OVERRIDE}: {e}")
+
+            # tampilkan error & JANGAN fallback
+            with st.sidebar.expander("⚙ Model Info", expanded=True):
+                st.error(f"Gagal memuat MODEL_ID_CPU_OVERRIDE = `{MODEL_ID_CPU_OVERRIDE}`")
+                if errors:
+                    st.write("Load notes:")
+                    st.code("\n".join(errors))
+            st.stop()  # hentikan app di sini supaya penyebab terlihat jelas
+
+    # 2) Jika tidak ada override (atau kamu hapus st.stop di atas), jalan normal
+    if model is None:
+        if use_cuda:
             try:
-                cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
-                if hasattr(cfg, "quantization_config"):
-                    try: delattr(cfg, "quantization_config")
-                    except: pass
-                    try: cfg.__dict__.pop("quantization_config", None)
-                    except: pass
-                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
-                device = torch.device("cuda"); model.to(device); final_model_id = MODEL_ID
-            except Exception as e2:
-                errors.append(f"cuda fp32 load failed: {e2}")
-                base_id = "indobenchmark/indobert-base-p1"
-                cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
-                model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, **AUTH)
-                device = torch.device("cuda"); model.to(device); final_model_id = base_id
-    else:
-        for cand in cpu_candidates:
-            try:
-                cfg = AutoConfig.from_pretrained(cand, **AUTH)
-                if hasattr(cfg, "quantization_config"):
-                    try: delattr(cfg, "quantization_config")
-                    except: pass
-                    try: cfg.__dict__.pop("quantization_config", None)
-                    except: pass
-                if getattr(cfg, "num_labels", None) != 3: cfg.num_labels = 3
-                model = BertForSequenceClassification.from_pretrained(cand, config=cfg, torch_dtype=torch.float32, **AUTH)
-                device = torch.device("cpu"); model.to(device); model.float(); final_model_id = cand
-                break
+                model = BertForSequenceClassification.from_pretrained(
+                    MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH
+                )
+                device = next(model.parameters()).device
+                loaded_bnb_8bit = True
+                final_model_id = MODEL_ID
             except Exception as e:
-                errors.append(f"cpu load failed for {cand}: {e}")
-                continue
+                errors.append(f"cuda 8bit load failed: {e}")
+                try:
+                    cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
+                    if hasattr(cfg, "quantization_config"):
+                        try: delattr(cfg, "quantization_config")
+                        except: pass
+                        try: cfg.__dict__.pop("quantization_config", None)
+                        except: pass
+                    model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
+                    device = torch.device("cuda")
+                    model.to(device)
+                    final_model_id = MODEL_ID
+                except Exception as e2:
+                    errors.append(f"cuda fp32 load failed: {e2}")
+        # CPU fallback ke base jika semua gagal & tidak ada override
         if model is None:
             base_id = "indobenchmark/indobert-base-p1"
             cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
-            model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, torch_dtype=torch.float32, **AUTH)
-            device = torch.device("cpu"); model.to(device); model.float(); final_model_id = base_id
+            model = BertForSequenceClassification.from_pretrained(
+                base_id, config=cfg, torch_dtype=torch.float32, **AUTH
+            )
+            device = torch.device("cpu")
+            model.to(device)
+            model.float()
+            final_model_id = base_id
 
+    # Quantization CPU opsional
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
@@ -440,22 +464,20 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 7):
 
     # Label map dari config
     try:
-        id2label = {int(k): (str(v).lower()) for k, v in model.config.id2label.items()}
-        label2id = {v:k for k,v in id2label.items()}
-        if len(id2label) != getattr(model.config, "num_labels", 3): raise KeyError
+        id2label = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
+        label2id = {v: k for k, v in id2label.items()}
+        if len(id2label) != getattr(model.config, "num_labels", 3):
+            raise KeyError
     except Exception:
-        id2label = {0:"negative",1:"neutral",2:"positive"}
-        label2id = {v:k for k,v in id2label.items()}
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+        label2id = {v: k for k, v in id2label.items()}
 
-    # Override dari LABEL_MAP
+    # Override LABEL_MAP (secrets)
     if LABEL_MAP_RAW:
-        try:
-            for pair in LABEL_MAP_RAW.split(","):
-                i, name = pair.split(":", 1)
-                id2label[int(i)] = str(name).strip().lower()
-            label2id = {v:k for k,v in id2label.items()}
-        except Exception as e:
-            errors.append(f"LABEL_MAP parse failed: {e}")
+        for pair in LABEL_MAP_RAW.split(","):
+            i, name = pair.split(":", 1)
+            id2label[int(i)] = str(name).strip().lower()
+        label2id = {v: k for k, v in id2label.items()}
 
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
@@ -494,7 +516,7 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=7  # bust cache saat perlu
+        quantize=use_quant_tmp, _v=8  # bust cache saat perlu
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -645,7 +667,7 @@ elif page == "Scraping Data":
                             if 'content' in df.columns: df = df.rename(columns={'content':'review_text'})
                             elif 'review_text' not in df.columns: df['review_text'] = df.get('body', '')
                             if 'at' in df.columns: df = df.drop(columns=['at'])
-                            st.success(f"✅ Berhasil mengambil {len[df]} ulasan dari batch terbaru.")
+                            st.success(f"✅ Berhasil mengambil {len(df)} ulasan dari batch terbaru.")
                             st.dataframe(df[['review_text','category','score','timestamp']].head())
                             st.session_state.df_scraped = df
                             st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'), "scraped_data.csv", "text/csv")
