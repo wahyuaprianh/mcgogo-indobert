@@ -20,7 +20,7 @@ from wordcloud import WordCloud
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
 # Model
-from transformers import BertTokenizer, BertForSequenceClassification, BertConfig
+from transformers import BertTokenizer, BertForSequenceClassification
 from sklearn.metrics import confusion_matrix, classification_report
 
 # Scraper
@@ -36,11 +36,9 @@ torch.set_grad_enabled(False)
 MODEL_ID = "wahyuaprian/indobert-sentiment-mcgogo-8bit"
 APP_ID = "com.mobilechess.gp"
 
-LABEL_TO_INDEX = {'positive': 0, 'neutral': 1, 'negative': 2}
-INDEX_TO_LABEL = {v: k for k, v in LABEL_TO_INDEX.items()}
-VALID_LABELS = set(LABEL_TO_INDEX.keys())
-
-COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}  # konsisten di semua chart
+# warna konsisten untuk semua chart
+COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
+VALID_LABELS = set(COLOR_MAP.keys())
 
 # ========= UI Helpers =========
 @st.cache_data
@@ -91,7 +89,7 @@ def ensure_nltk():
         nltk.download('stopwords')
 ensure_nltk()
 
-# ========= Preprocessing =========
+# ========= Preprocessing (EDA) =========
 @st.cache_data
 def load_stopwords():
     sw = set(stopwords.words('indonesian'))
@@ -101,7 +99,6 @@ def load_stopwords():
         "utk","ya","jd","jgn","sdh","aja","n","t","nyg","hehe","pen","u",
         "nan","loh","yah","dr","gw","gue"
     ])
-    # opsional: muat tambahan lokal
     path = './data/stopwords_id.txt'
     if os.path.exists(path):
         try:
@@ -153,21 +150,11 @@ def tokenize(text: str):
     try:
         return list(TOKTOK.tokenize(text))
     except Exception:
-        # fallback terakhir: regex huruf saja
         return re.findall(r"[A-Za-z]+", text)
 
 def remove_stopwords(tokens): return [w for w in tokens if w not in LIST_STOPWORDS]
 def stem(tokens): return [STEMMER.stem(w) for w in tokens]
 def normalize(tokens): return [KAMUS_BAKU.get(t, t) for t in tokens]
-
-def preprocess_single_text(raw_text: str) -> str:
-    """Selalu kembalikan string non-kosong agar tokenizer aman."""
-    cleaned = clean_review(raw_text or "")
-    tokens = normalize(stem(remove_stopwords(tokenize(cleaned))))
-    txt = " ".join(tokens).strip()
-    if not txt: txt = cleaned.strip()
-    if not txt: txt = "netral"
-    return txt
 
 def preprocess_dataframe(df_raw_input: pd.DataFrame) -> pd.DataFrame:
     df = df_raw_input.copy()
@@ -193,6 +180,16 @@ def preprocess_dataframe(df_raw_input: pd.DataFrame) -> pd.DataFrame:
     df.loc[empty, "review_text_normalizedjoin"] = df.loc[empty, "review_text_cleaned"].replace("", "netral")
     return df
 
+# ========= Preprocessing untuk MODEL (light) =========
+_light_re = re.compile(r"(http\S+|www\S+|[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF])")
+def preprocess_for_model(text: str) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    text = _light_re.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if text else "netral"
+
+# ========= Scraping helper =========
 def map_score_to_sentiment(score: int) -> str:
     if score in (1,2): return 'negative'
     if score == 3:     return 'neutral'
@@ -205,26 +202,40 @@ def get_top_ngrams(corpus: str, n=2, top=15):
     fdist = FreqDist(ngrams(tokens, n))
     return pd.DataFrame(fdist.most_common(top), columns=["Ngram", "Frequency"])
 
-# ========= Model Loader =========
+# ========= Model Loader (ambil mapping dari config) =========
+def _standardize_label(lbl: str) -> str:
+    l = (lbl or "").lower()
+    if l.startswith("pos"): return "positive"
+    if l.startswith("neu"): return "neutral"
+    if l.startswith("neg"): return "negative"
+    if l in VALID_LABELS:   return l
+    return l  # fallback: biarkan apa adanya
+
 @st.cache_resource
 def load_model_and_tokenizer():
     try:
+        # coba 8-bit
         tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
-        config = BertConfig.from_pretrained(MODEL_ID); config.num_labels = 3
-        try:
-            model = BertForSequenceClassification.from_pretrained(
-                MODEL_ID, config=config, load_in_8bit=True, device_map="auto"
-            )
-            device = next(model.parameters()).device
-        except Exception:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=config).to(device)
-        model.eval()
-        return tokenizer, model, device
-    except Exception as e:
-        st.error(f"Gagal memuat model/tokenizer: {e}")
-        st.stop()
-tokenizer, model, device = load_model_and_tokenizer()
+        model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto")
+        device = next(model.parameters()).device
+    except Exception:
+        tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
+        model = BertForSequenceClassification.from_pretrained(MODEL_ID)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+
+    model.eval()
+
+    # mapping dari config -> distandardisasi
+    cfg = model.config
+    id2label_raw = getattr(cfg, "id2label", {0: "positive", 1: "neutral", 2: "negative"})
+    label2id_raw = getattr(cfg, "label2id", {"positive": 0, "neutral": 1, "negative": 2})
+    id2label = {int(k): _standardize_label(v) for k, v in (id2label_raw.items() if isinstance(id2label_raw, dict) else enumerate(id2label_raw))}
+    label2id = { _standardize_label(k): int(v) for k, v in label2id_raw.items() }
+
+    return tokenizer, model, device, id2label, label2id
+
+tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer()
 
 # ========= Sidebar =========
 if "page" not in st.session_state:
@@ -271,7 +282,7 @@ if page == "Beranda":
     </table>
     """, unsafe_allow_html=True)
 
-    # ==== SINERGI + CAROUSEL (sesuai permintaan) ====
+    # ==== SINERGI + CAROUSEL ====
     st.subheader("Sinergi Hero Magic Chess Go Go")
     items = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
@@ -370,23 +381,20 @@ elif page == "Preprocessing":
             st.dataframe(df_raw[cols].head())
 
     if df_raw is not None and not df_raw.empty:
-        # Distribusi label valid, dengan warna konsisten
+        # Distribusi label valid
         if 'category' in df_raw.columns:
             tmp = df_raw[df_raw['category'].isin(VALID_LABELS)]
             if not tmp.empty:
                 st.subheader("➡️ Distribusi Sentimen Data Asli (label valid)")
                 counts = tmp['category'].value_counts()
-                # Susun urutan & warna
                 order = ['positive','neutral','negative']
                 counts = counts.reindex(order).fillna(0)
                 fig = px.bar(
                     x=counts.index, y=counts.values,
                     labels={'x':'category','y':'count'},
                     title='Distribusi Sentimen Data Asli',
-                    color=counts.index,
-                    color_discrete_map=COLOR_MAP
+                    color=counts.index, color_discrete_map=COLOR_MAP
                 )
-                # agar legend rapi
                 fig.update_layout(showlegend=False)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -447,15 +455,15 @@ elif page == "Modeling & Evaluasi":
         df_eval = st.session_state.df_preprocessed
         st.write("Menggunakan data hasil preprocessing.")
     else:
-        up = st.file_uploader("Upload File Preprocessed", type=["tsv","csv"], key="eval_upload")
+        up = st.file_uploader("Upload File Preprocessed / Raw", type=["tsv","csv"], key="eval_upload")
         if up is not None:
             df_eval = pd.read_csv(up, sep='\t' if up.name.endswith('.tsv') else ',')
 
     if df_eval is not None and not df_eval.empty:
-        required = {'review_text_normalizedjoin','category'}
-        if not required.issubset(df_eval.columns):
-            st.error("File harus memiliki kolom 'review_text_normalizedjoin' dan 'category'.")
+        if 'review_text' not in df_eval.columns or 'category' not in df_eval.columns:
+            st.error("File harus memiliki kolom 'review_text' dan 'category'.")
         else:
+            # filter label ground-truth yang valid
             df_eval = df_eval[df_eval['category'].isin(VALID_LABELS)].reset_index(drop=True)
             if df_eval.empty:
                 st.warning("Tidak ada baris dengan label valid untuk evaluasi.")
@@ -466,13 +474,13 @@ elif page == "Modeling & Evaluasi":
                     prog = st.progress(0); info = st.empty()
                     preds = []; total = len(df_eval); t0 = time.time()
 
-                    for i, text in enumerate(df_eval['review_text_normalizedjoin'].astype(str)):
-                        text_safe = preprocess_single_text(text)
-                        enc = tokenizer(text_safe, return_tensors='pt', truncation=True, padding=True, max_length=512)
+                    for i, raw in enumerate(df_eval['review_text'].astype(str)):
+                        text_for_model = preprocess_for_model(raw)
+                        enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True, max_length=512)
                         enc = {k: v.to(device) for k, v in enc.items()}
                         logits = model(**enc).logits
                         label_id = int(torch.argmax(logits, dim=-1).item())
-                        preds.append(INDEX_TO_LABEL[label_id])
+                        preds.append(ID2LABEL.get(label_id, "unknown"))
 
                         p = (i+1)/total; eta = (time.time()-t0)/(i+1) * (total-i-1)
                         info.text(f"Memproses {i+1}/{total} ({p*100:.1f}%) | ETA: {datetime.timedelta(seconds=int(eta))}")
@@ -481,16 +489,18 @@ elif page == "Modeling & Evaluasi":
                     df_eval['predicted_category'] = preds
                     st.success("Evaluasi selesai! ✅")
 
-                    y_true = df_eval['category'].map(LABEL_TO_INDEX).astype(int).to_numpy()
-                    y_pred = df_eval['predicted_category'].map(LABEL_TO_INDEX).astype(int).to_numpy()
+                    # mapping ke id menggunakan LABEL2ID (dari config yang sudah distandardisasi)
+                    y_true = df_eval['category'].map(LABEL2ID).astype(int).to_numpy()
+                    y_pred = df_eval['predicted_category'].map(LABEL2ID).astype(int).to_numpy()
+
+                    # urutan label konsisten
+                    order_names = ['positive','neutral','negative']
+                    order_ids = [LABEL2ID.get(n, i) for i, n in enumerate(order_names)]
 
                     st.subheader("🔢 Confusion Matrix")
-                    cm = confusion_matrix(y_true, y_pred, labels=[0,1,2])
+                    cm = confusion_matrix(y_true, y_pred, labels=order_ids)
                     fig_cm = px.imshow(
-                        cm,
-                        x=['positive','neutral','negative'],
-                        y=['positive','neutral','negative'],
-                        text_auto=True,
+                        cm, x=order_names, y=order_names, text_auto=True,
                         labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
                         title="Confusion Matrix"
                     )
@@ -498,14 +508,12 @@ elif page == "Modeling & Evaluasi":
 
                     st.subheader("📝 Classification Report")
                     report = classification_report(y_true, y_pred,
-                        target_names=['positive','neutral','negative'],
-                        output_dict=True, zero_division=0)
+                        target_names=order_names, output_dict=True, zero_division=0)
                     st.dataframe(pd.DataFrame(report).T)
 
                     st.subheader("🥧 Proporsi Sentimen Prediksi")
                     counts = df_eval['predicted_category'].value_counts()
-                    order = ['positive','neutral','negative']
-                    counts = counts.reindex(order).fillna(0)
+                    counts = counts.reindex(order_names).fillna(0)
                     fig_pie = px.pie(
                         values=counts.values, names=counts.index,
                         title='Proporsi Sentimen Prediksi',
@@ -525,14 +533,14 @@ elif page == "Prediksi":
             prog = st.progress(0); info = st.empty()
             preds, confs = [], []; total = len(dfp); t0 = time.time()
 
-            for i, text in enumerate(dfp['review_text_normalizedjoin'].astype(str)):
-                text_safe = preprocess_single_text(text)
-                enc = tokenizer(text_safe, return_tensors='pt', truncation=True, padding=True, max_length=512)
+            for i, raw in enumerate(dfp['review_text'].astype(str)):
+                text_for_model = preprocess_for_model(raw)
+                enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True, max_length=512)
                 enc = {k: v.to(device) for k, v in enc.items()}
                 logits = model(**enc).logits
                 probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
                 lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
-                preds.append(INDEX_TO_LABEL[lid]); confs.append(f"{conf:.2f}%")
+                preds.append(ID2LABEL.get(lid, "unknown")); confs.append(f"{conf:.2f}%")
 
                 p = (i+1)/total
                 info.text(f"Memproses {i+1}/{total} ({p*100:.1f}%)")
@@ -563,13 +571,13 @@ elif page == "Prediksi":
     user_input = st.text_area("Masukkan ulasan:", height=150)
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
-            text_safe = preprocess_single_text(user_input)
-            enc = tokenizer(text_safe, return_tensors='pt', truncation=True, padding=True, max_length=512)
+            text_for_model = preprocess_for_model(user_input)
+            enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True, max_length=512)
             enc = {k: v.to(device) for k, v in enc.items()}
             logits = model(**enc).logits
             probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
             lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
-            predicted = INDEX_TO_LABEL[lid]
+            predicted = ID2LABEL.get(lid, "unknown")
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
