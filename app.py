@@ -1,4 +1,4 @@
-# app.py (FINAL FAST, CPU-clean, ignore repo 8-bit on CPU)
+# app.py (FINAL FAST + robust loader CPU/GPU + 8bit-aware)
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 
-# ==== CPU threading tuning (helps on Streamlit Cloud CPU) ====
+# ==== CPU threading tuning ====
 try:
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, min(os.cpu_count() or 1, 4)))
@@ -35,8 +35,12 @@ from nltk import ngrams
 from wordcloud import WordCloud
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
-# Model
-from transformers import BertTokenizer, BertForSequenceClassification, AutoConfig
+# HF
+from transformers import (
+    BertTokenizer,
+    BertForSequenceClassification,
+    AutoConfig,
+)
 from sklearn.metrics import confusion_matrix, classification_report
 
 # Scraper
@@ -48,11 +52,16 @@ from streamlit_carousel import carousel
 # ========= App Config =========
 st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go Go Menggunakan IndoBERT")
 
-MODEL_ID = "wahyuaprian/indobert-sentiment-mcgogo-8bit"
+MODEL_ID = os.getenv("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
+# Optional override untuk CPU (model FP32 kamu)
+MODEL_ID_CPU_OVERRIDE = os.getenv("MODEL_ID_CPU_OVERRIDE", "").strip() or None
 APP_ID = "com.mobilechess.gp"
 
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
+LABELS = ['positive','neutral','negative']
+LABEL2ID_DEFAULT = {k:i for i,k in enumerate(LABELS)}
+ID2LABEL_DEFAULT = {i:k for k,i in LABEL2ID_DEFAULT.items()}
 
 # ========= UI Helpers =========
 @st.cache_data
@@ -85,7 +94,7 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ========= NLTK Guards (stopwords only) =========
+# ========= NLTK Guards =========
 @st.cache_data
 def ensure_nltk():
     try:
@@ -256,7 +265,6 @@ def fetch_reviews_by_date(
             break
 
         all_rows.extend(batch)
-
         if show_progress:
             pct = int(min(100, (page + 1) / max_pages * 100))
             prog.progress(pct)
@@ -269,7 +277,6 @@ def fetch_reviews_by_date(
             last_at = last_at.astimezone(datetime.timezone.utc).replace(tzinfo=None)
         if isinstance(last_at, datetime.datetime) and last_at < start_dt:
             break
-
         if token is None:
             break
 
@@ -321,57 +328,94 @@ def get_runtime_params(mode: str, device: torch.device):
         use_quant = True if device.type == "cpu" else False
     return max_len, batch_size, use_quant
 
-# ========= Model Loader (robust vs repo 8-bit) =========
+# ========= Robust Model Loader (handles 8-bit repo on CPU) =========
 @st.cache_resource
 def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
-    # Tokenizer cepat
-    try:
-        tokenizer = BertTokenizer.from_pretrained(MODEL_ID, use_fast=True)
-    except Exception:
-        tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
-
     use_cuda = torch.cuda.is_available()
+
+    # Build candidate list untuk CPU fallback
+    cpu_candidates = []
+    if MODEL_ID_CPU_OVERRIDE:
+        cpu_candidates.append(MODEL_ID_CPU_OVERRIDE)
+    if "8bit" in MODEL_ID.lower():
+        for suf in ["fp32", "full", "float32"]:
+            cpu_candidates.append(MODEL_ID.replace("8bit", suf))
+    # base IndoBERT (last resort, head 3 label akan diinit random)
+    cpu_candidates += ["indobenchmark/indobert-base-p1", "indolem/indobert-base-uncased"]
+
+    model = None
+    device = None
+    final_model_id = MODEL_ID
     loaded_bnb_8bit = False
 
     if use_cuda:
-        # GPU: boleh pakai 8-bit (bitsandbytes)
+        # Prefer 8-bit di GPU
         try:
             model = BertForSequenceClassification.from_pretrained(
                 MODEL_ID, load_in_8bit=True, device_map="auto"
             )
             device = next(model.parameters()).device
+            final_model_id = MODEL_ID
             loaded_bnb_8bit = True
         except Exception:
-            # fallback fp32 di CUDA
-            cfg = AutoConfig.from_pretrained(MODEL_ID)
-            model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
-            device = torch.device("cuda")
-            # aman memanggil .to() karena bukan bnb 8-bit
-            model.to(device)
+            # fallback ke FP32 di CUDA (jika repo mendukung)
+            try:
+                cfg = AutoConfig.from_pretrained(MODEL_ID)
+                if hasattr(cfg, "quantization_config"):
+                    try: delattr(cfg, "quantization_config")
+                    except Exception: pass
+                    try: cfg.__dict__.pop("quantization_config", None)
+                    except Exception: pass
+                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
+                device = torch.device("cuda")
+                model.to(device)
+                final_model_id = MODEL_ID
+            except Exception:
+                # terakhir: pakai base IndoBERT di CUDA
+                base_id = "indobenchmark/indobert-base-p1"
+                cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
+                model = BertForSequenceClassification.from_pretrained(base_id, config=cfg)
+                device = torch.device("cuda")
+                model.to(device)
+                final_model_id = base_id
     else:
-        # CPU: abaikan quantization bawaan repo
-        cfg = AutoConfig.from_pretrained(MODEL_ID)
-        # buang quantization_config agar tidak auto-8bit
-        try:
-            if hasattr(cfg, "quantization_config"):
-                try:
-                    delattr(cfg, "quantization_config")
-                except Exception:
-                    pass
-                try:
-                    cfg.__dict__.pop("quantization_config", None)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        model = BertForSequenceClassification.from_pretrained(
-            MODEL_ID, config=cfg, torch_dtype=torch.float32
-        )
-        device = torch.device("cpu")
-        # aman dipindah ke CPU karena bukan bnb 8-bit
-        model.to(device)
-        model.float()  # pastikan FP32
+        # CPU path: jangan pakai repo 8-bit; coba kandidat FP32
+        load_err = None
+        for cand in cpu_candidates:
+            try:
+                cfg = AutoConfig.from_pretrained(cand)
+                # pastikan tak ada jejak quantization_config
+                if hasattr(cfg, "quantization_config"):
+                    try: delattr(cfg, "quantization_config")
+                    except Exception: pass
+                    try: cfg.__dict__.pop("quantization_config", None)
+                    except Exception: pass
+                # pastikan 3 label
+                if getattr(cfg, "num_labels", None) != 3:
+                    cfg.num_labels = 3
+                model = BertForSequenceClassification.from_pretrained(
+                    cand, config=cfg, torch_dtype=torch.float32
+                )
+                device = torch.device("cpu")
+                model.to(device)
+                model.float()
+                final_model_id = cand
+                load_err = None
+                break
+            except Exception as e:
+                load_err = e
+                continue
+        if model is None:
+            # Last resort: base IndoBERT FP32 di CPU
+            base_id = "indobenchmark/indobert-base-p1"
+            cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
+            model = BertForSequenceClassification.from_pretrained(
+                base_id, config=cfg, torch_dtype=torch.float32
+            )
+            device = torch.device("cpu")
+            model.to(device)
+            model.float()
+            final_model_id = base_id
 
     # Quantization CPU opsional (bukan bnb)
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
@@ -395,12 +439,37 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
 
     model.eval()
 
-    # Normalisasi id2label/label2id
+    # Tokenizer harus match dengan final_model_id
+    try:
+        tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True)
+    except Exception:
+        tokenizer = BertTokenizer.from_pretrained(final_model_id)
+
+    # Sinkronisasi label map ke 3 kelas standar
     cfg2 = model.config
-    id2label_raw = getattr(cfg2, "id2label", {0: "positive", 1: "neutral", 2: "negative"})
-    label2id_raw = getattr(cfg2, "label2id", {"positive": 0, "neutral": 1, "negative": 2})
-    id2label = {int(k): _standardize_label(v) for k, v in (id2label_raw.items() if isinstance(id2label_raw, dict) else enumerate(id2label_raw))}
-    label2id = {_standardize_label(k): int(v) for k, v in label2id_raw.items()}
+    need_fix_map = (
+        getattr(cfg2, "num_labels", None) != 3
+        or any(lbl not in {'positive','neutral','negative'} for lbl in getattr(cfg2, "id2label", {}).values())
+    )
+    if need_fix_map:
+        cfg2.num_labels = 3
+        cfg2.id2label = ID2LABEL_DEFAULT.copy()
+        cfg2.label2id = LABEL2ID_DEFAULT.copy()
+        try:
+            model.config = cfg2
+        except Exception:
+            pass
+
+    # Pastikan mapping rapi
+    id2label = {int(k): _standardize_label(v) for k, v in getattr(model.config, "id2label", ID2LABEL_DEFAULT).items()} if isinstance(getattr(model.config, "id2label", {}), dict) else ID2LABEL_DEFAULT
+    label2id = {_standardize_label(k): int(v) for k, v in getattr(model.config, "label2id", LABEL2ID_DEFAULT).items()} if isinstance(getattr(model.config, "label2id", {}), dict) else LABEL2ID_DEFAULT
+
+    # Info kecil di sidebar
+    with st.sidebar.expander("⚙ Model Info", expanded=False):
+        st.write(f"Model: `{final_model_id}`")
+        st.write(f"Device: `{device.type}`")
+        st.write(f"8-bit bnb: `{loaded_bnb_8bit}`")
+
     return tokenizer, model, device, id2label, label2id
 
 # ========= Sidebar & Mode =========
@@ -428,9 +497,9 @@ mode_choice = st.sidebar.radio(
 _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
 
-# Bust cache via _v bila perlu
+# Bust cache via _v jika perlu (ubah angkanya kalau loader kamu edit lagi)
 tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-    quantize=use_quant_tmp, _v=3
+    quantize=use_quant_tmp, _v=4
 )
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 
