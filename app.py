@@ -1,5 +1,4 @@
-# app.py (FINAL SUPER-FAST): pre-encode tokenization + fast tokenizer + threads + all previous features
-
+# app.py (FAST MODE, siap copy)
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
@@ -18,6 +17,12 @@ try:
     # cap threads to avoid oversubscription; adjust if you have more cores
     torch.set_num_threads(max(1, min(os.cpu_count() or 1, 4)))
     os.environ.setdefault("OMP_NUM_THREADS", str(torch.get_num_threads()))
+    os.environ.setdefault("MKL_NUM_THREADS", str(torch.get_num_threads()))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(torch.get_num_threads()))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(torch.get_num_threads()))
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 except Exception:
     pass
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
@@ -381,30 +386,82 @@ page = st.session_state.page
 
 # ========= FAST Prediction utils =========
 def preencode_texts(texts: List[str]):
-    # Light cleaning only, vectorized
+    """Pre-encode seluruh teks (gunakan kalau mau), tetapi padding-8 hanya saat non-CPU."""
     cleaned = [preprocess_for_model(t) for t in texts]
     enc = tokenizer(
         cleaned, return_tensors='pt', truncation=True, padding=True,
-        max_length=MAX_LEN, pad_to_multiple_of=8
+        max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None)
     )
     return enc  # tensors on CPU first
 
 def predict_from_preencoded(enc_all, batch_size=BATCH_SIZE, return_conf=False):
+    """Tetap tersedia, tapi tidak dipakai untuk evaluasi cepat."""
     preds, confs = [], []
     total = enc_all["input_ids"].shape[0]
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         batch = {k: v[start:end].to(device, non_blocking=True) for k, v in enc_all.items()}
         with torch.inference_mode():
-            logits = model(**batch).logits
+            if device.type == "cuda":
+                with torch.autocast('cuda', dtype=torch.float16):
+                    logits = model(**batch).logits
+            else:
+                logits = model(**batch).logits
             if return_conf:
                 probs = F.softmax(logits, dim=-1)
                 pred_ids = probs.argmax(dim=-1).tolist()
                 preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
                 confs.extend((probs.max(dim=-1).values * 100).tolist())
             else:
-                pred_ids = logits.argmax(dim=-1).tolist()  # argmax langsung (lebih cepat)
+                pred_ids = logits.argmax(dim=-1).tolist()
                 preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+    return (preds, confs) if return_conf else preds
+
+def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return_conf: bool = False):
+    """CEPAT: tokenize per-batch (dynamic padding by batch) + throttled UI."""
+    preds, confs = [], []
+    prog = st.progress(0); info = st.empty()
+    N = len(texts)
+    processed = 0
+    last_ui = time.time()
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch_texts = [preprocess_for_model(t) for t in texts[start:end]]
+        enc = tokenizer(
+            batch_texts,
+            return_tensors='pt',
+            truncation=True,
+            padding=True,                # pad ke longest DI DALAM batch
+            max_length=MAX_LEN,
+            pad_to_multiple_of=(8 if device.type != "cpu" else None),
+        )
+        enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+
+        with torch.inference_mode():
+            if device.type == "cuda":
+                with torch.autocast('cuda', dtype=torch.float16):
+                    logits = model(**enc).logits
+            else:
+                logits = model(**enc).logits
+
+            if return_conf:
+                probs = F.softmax(logits, dim=-1)
+                pred_ids = probs.argmax(dim=-1).tolist()
+                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+                confs.extend((probs.max(dim=-1).values * 100).tolist())
+            else:
+                pred_ids = logits.argmax(dim=-1).tolist()
+                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+
+        processed += (end - start)
+        if time.time() - last_ui > 0.25:
+            pct = int(processed / N * 100)
+            prog.progress(pct)
+            info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
+            last_ui = time.time()
+
+    prog.progress(100)
     return (preds, confs) if return_conf else preds
 
 # ========= Page Layout =========
@@ -525,7 +582,7 @@ elif page == "Scraping Data":
                             elif 'review_text' not in df.columns: df['review_text'] = df.get('body', '')
                             if 'at' in df.columns: df = df.drop(columns=['at'])
 
-                            st.success(f"✅ Berhasil mengambil {len(df)} ulasan dari batch terbaru.")
+                            st.success(f"✅ Berhasil mengambil {len[df]} ulasan dari batch terbaru.")
                             st.dataframe(df[['review_text','category','score','timestamp']].head())
                             st.session_state.df_scraped = df
                             st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'),
@@ -641,32 +698,8 @@ elif page == "Modeling & Evaluasi":
                 if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
                     texts = df_eval['review_text'].astype(str).tolist()
 
-                    with st.spinner("Pre-encode tokenization..."):
-                        enc_all = preencode_texts(texts)
-
-                    preds = []
-                    prog = st.progress(0); info = st.empty()
-                    total = enc_all["input_ids"].shape[0]
-                    for start in range(0, total, BATCH_SIZE):
-                        end = min(start + BATCH_SIZE, total)
-                        batch_preds = predict_from_preencoded(enc_all[start:end] if isinstance(enc_all, list) else
-                                                             {k: v[start:end] for k, v in enc_all.items()},
-                                                             batch_size=BATCH_SIZE, return_conf=False)
-                        preds.extend(batch_preds)
-                        prog.progress(int(end / total * 100))
-                        info.text(f"Memproses {end}/{total} ({end/total*100:.1f}%)")
-
-                    # catatan: predict_from_preencoded di atas butuh dict; kita sudah slice dict
-                    # untuk kejelasan, panggil ulang dengan cara yang konsisten:
-                    preds = []
-                    prog = st.progress(0); info = st.empty()
-                    for start in range(0, total, BATCH_SIZE):
-                        end = min(start + BATCH_SIZE, total)
-                        batch_dict = {k: v[start:end] for k, v in enc_all.items()}
-                        batch_preds = predict_from_preencoded(batch_dict, batch_size=BATCH_SIZE, return_conf=False)
-                        preds.extend(batch_preds)
-                        prog.progress(int(end / total * 100))
-                        info.text(f"Memproses {end}/{total} ({end/total*100:.1f}%)")
+                    with st.spinner("Inferensi cepat (dynamic padding per-batch)..."):
+                        preds = predict_texts_dynamic(texts, batch_size=BATCH_SIZE, return_conf=False)
 
                     df_eval['predicted_category'] = preds
                     st.success("Evaluasi selesai! ✅")
@@ -709,22 +742,11 @@ elif page == "Prediksi":
             dfp = st.session_state.df_preprocessed.copy()
             texts = dfp['review_text'].astype(str).tolist()
 
-            with st.spinner("Pre-encode tokenization..."):
-                enc_all = preencode_texts(texts)
-
-            preds, confs = [], []
-            prog = st.progress(0); info = st.empty()
-            total = enc_all["input_ids"].shape[0]
-            for start in range(0, total, BATCH_SIZE):
-                end = min(start + BATCH_SIZE, total)
-                batch_dict = {k: v[start:end] for k, v in enc_all.items()}
-                batch_preds, batch_confs = predict_from_preencoded(batch_dict, batch_size=BATCH_SIZE, return_conf=True)
-                preds.extend(batch_preds); confs.extend([f"{c:.2f}%" for c in batch_confs])
-                prog.progress(int(end / total * 100))
-                info.text(f"Memproses {end}/{total} ({end/total*100:.1f}%)")
+            with st.spinner("Inferensi cepat (dynamic padding per-batch, beserta confidence)..."):
+                preds, confs = predict_texts_dynamic(texts, batch_size=BATCH_SIZE, return_conf=True)
 
             dfp['predicted_category'] = preds
-            dfp['confidence'] = confs
+            dfp['confidence'] = [f"{c:.2f}%" for c in confs]
             st.success("Prediksi batch selesai! ✅")
             st.dataframe(dfp[['review_text','predicted_category','confidence']].head())
 
@@ -744,11 +766,17 @@ elif page == "Prediksi":
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
             text_for_model = preprocess_for_model(user_input)
-            enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True,
-                            max_length=MAX_LEN, pad_to_multiple_of=8)
-            enc = {k: v.to(device) for k, v in enc.items()}
+            enc = tokenizer(
+                text_for_model, return_tensors='pt', truncation=True, padding=True,
+                max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None)
+            )
+            enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
             with torch.inference_mode():
-                logits = model(**enc).logits
+                if device.type == "cuda":
+                    with torch.autocast('cuda', dtype=torch.float16):
+                        logits = model(**enc).logits
+                else:
+                    logits = model(**enc).logits
                 probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
                 lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
             predicted = ID2LABEL.get(lid, "unknown")
