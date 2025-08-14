@@ -1,4 +1,4 @@
-# app.py (FAST MODE, siap copy)
+# app.py (FINAL FAST, CPU-clean, ready to copy)
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
@@ -322,32 +322,60 @@ def get_runtime_params(mode: str, device: torch.device):
         use_quant = True if device.type == "cpu" else False
     return max_len, batch_size, use_quant
 
-# ========= Model Loader =========
+# ========= Model Loader (fix Half vs Float; CPU-clean) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False):
-    # Fast tokenizer speeds up a lot
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
+    # Fast tokenizer
     try:
         tokenizer = BertTokenizer.from_pretrained(MODEL_ID, use_fast=True)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
 
-    # Try 8-bit (GPU); fallback CPU
-    try:
-        model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto")
-        device = next(model.parameters()).device
-    except Exception:
-        model = BertForSequenceClassification.from_pretrained(MODEL_ID)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
+    use_cuda = torch.cuda.is_available()
+    loaded_8bit = False
 
-    # Dynamic quantization (CPU only)
-    if device.type == "cpu" and quantize:
+    if use_cuda:
+        # 8-bit hanya di CUDA
         try:
-            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+            model = BertForSequenceClassification.from_pretrained(
+                MODEL_ID, load_in_8bit=True, device_map="auto"
+            )
+            device = next(model.parameters()).device
+            loaded_8bit = True
         except Exception:
-            pass
+            model = BertForSequenceClassification.from_pretrained(MODEL_ID)
+            device = torch.device("cuda")
+            model.to(device)
+    else:
+        # CPU path: pastikan FP32 aktif
+        model = BertForSequenceClassification.from_pretrained(MODEL_ID)
+        device = torch.device("cpu")
+        model.to(device)
+        model.float()  # penting: aktivasi dan weight FP32 di CPU
+
+    # Quantization CPU opsional (jika belum 8-bit & diminta)
+    if device.type == "cpu" and quantize and not loaded_8bit:
+        try:
+            from torchao.quantization import quantize_, int8_dynamic
+            quantize_(model, int8_dynamic())  # in-place, input Float
+        except Exception:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="torch.ao.quantization is deprecated",
+                    category=DeprecationWarning,
+                )
+                try:
+                    model = torch.quantization.quantize_dynamic(
+                        model, {torch.nn.Linear}, dtype=torch.qint8
+                    )
+                except Exception:
+                    pass  # tetap FP32 jika gagal
 
     model.eval()
+
+    # Normalisasi id2label/label2id
     cfg = model.config
     id2label_raw = getattr(cfg, "id2label", {0: "positive", 1: "neutral", 2: "negative"})
     label2id_raw = getattr(cfg, "label2id", {"positive": 0, "neutral": 1, "negative": 2})
@@ -379,14 +407,18 @@ mode_choice = st.sidebar.radio(
 
 _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
-tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(quantize=use_quant_tmp)
+
+# Bust cache via _v jika perlu reload (ubah angkanya bila kamu edit loader)
+tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
+    quantize=use_quant_tmp, _v=2
+)
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 
 page = st.session_state.page
 
 # ========= FAST Prediction utils =========
 def preencode_texts(texts: List[str]):
-    """Pre-encode seluruh teks (gunakan kalau mau), tetapi padding-8 hanya saat non-CPU."""
+    """Pre-encode seluruh teks (opsional), padding-8 hanya saat non-CPU."""
     cleaned = [preprocess_for_model(t) for t in texts]
     enc = tokenizer(
         cleaned, return_tensors='pt', truncation=True, padding=True,
@@ -395,7 +427,7 @@ def preencode_texts(texts: List[str]):
     return enc  # tensors on CPU first
 
 def predict_from_preencoded(enc_all, batch_size=BATCH_SIZE, return_conf=False):
-    """Tetap tersedia, tapi tidak dipakai untuk evaluasi cepat."""
+    """Tersedia bila ingin gunakan pre-encode; evaluasi cepat pakai dynamic."""
     preds, confs = [], []
     total = enc_all["input_ids"].shape[0]
     for start in range(0, total, batch_size):
@@ -582,7 +614,7 @@ elif page == "Scraping Data":
                             elif 'review_text' not in df.columns: df['review_text'] = df.get('body', '')
                             if 'at' in df.columns: df = df.drop(columns=['at'])
 
-                            st.success(f"✅ Berhasil mengambil {len[df]} ulasan dari batch terbaru.")
+                            st.success(f"✅ Berhasil mengambil {len(df)} ulasan dari batch terbaru.")
                             st.dataframe(df[['review_text','category','score','timestamp']].head())
                             st.session_state.df_scraped = df
                             st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'),
