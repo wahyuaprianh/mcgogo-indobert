@@ -1,4 +1,4 @@
-# app.py (FINAL FAST, CPU-clean, ready to copy)
+# app.py (FINAL FAST, CPU-clean, ignore repo 8-bit on CPU)
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
@@ -14,7 +14,6 @@ import torch.nn.functional as F
 # ==== CPU threading tuning (helps on Streamlit Cloud CPU) ====
 try:
     torch.set_grad_enabled(False)
-    # cap threads to avoid oversubscription; adjust if you have more cores
     torch.set_num_threads(max(1, min(os.cpu_count() or 1, 4)))
     os.environ.setdefault("OMP_NUM_THREADS", str(torch.get_num_threads()))
     os.environ.setdefault("MKL_NUM_THREADS", str(torch.get_num_threads()))
@@ -37,7 +36,7 @@ from wordcloud import WordCloud
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 
 # Model
-from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import BertTokenizer, BertForSequenceClassification, AutoConfig
 from sklearn.metrics import confusion_matrix, classification_report
 
 # Scraper
@@ -322,42 +321,63 @@ def get_runtime_params(mode: str, device: torch.device):
         use_quant = True if device.type == "cpu" else False
     return max_len, batch_size, use_quant
 
-# ========= Model Loader (fix Half vs Float; CPU-clean) =========
+# ========= Model Loader (robust vs repo 8-bit) =========
 @st.cache_resource
 def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
-    # Fast tokenizer
+    # Tokenizer cepat
     try:
         tokenizer = BertTokenizer.from_pretrained(MODEL_ID, use_fast=True)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(MODEL_ID)
 
     use_cuda = torch.cuda.is_available()
-    loaded_8bit = False
+    loaded_bnb_8bit = False
 
     if use_cuda:
-        # 8-bit hanya di CUDA
+        # GPU: boleh pakai 8-bit (bitsandbytes)
         try:
             model = BertForSequenceClassification.from_pretrained(
                 MODEL_ID, load_in_8bit=True, device_map="auto"
             )
             device = next(model.parameters()).device
-            loaded_8bit = True
+            loaded_bnb_8bit = True
         except Exception:
-            model = BertForSequenceClassification.from_pretrained(MODEL_ID)
+            # fallback fp32 di CUDA
+            cfg = AutoConfig.from_pretrained(MODEL_ID)
+            model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
             device = torch.device("cuda")
+            # aman memanggil .to() karena bukan bnb 8-bit
             model.to(device)
     else:
-        # CPU path: pastikan FP32 aktif
-        model = BertForSequenceClassification.from_pretrained(MODEL_ID)
-        device = torch.device("cpu")
-        model.to(device)
-        model.float()  # penting: aktivasi dan weight FP32 di CPU
+        # CPU: abaikan quantization bawaan repo
+        cfg = AutoConfig.from_pretrained(MODEL_ID)
+        # buang quantization_config agar tidak auto-8bit
+        try:
+            if hasattr(cfg, "quantization_config"):
+                try:
+                    delattr(cfg, "quantization_config")
+                except Exception:
+                    pass
+                try:
+                    cfg.__dict__.pop("quantization_config", None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    # Quantization CPU opsional (jika belum 8-bit & diminta)
-    if device.type == "cpu" and quantize and not loaded_8bit:
+        model = BertForSequenceClassification.from_pretrained(
+            MODEL_ID, config=cfg, torch_dtype=torch.float32
+        )
+        device = torch.device("cpu")
+        # aman dipindah ke CPU karena bukan bnb 8-bit
+        model.to(device)
+        model.float()  # pastikan FP32
+
+    # Quantization CPU opsional (bukan bnb)
+    if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
-            quantize_(model, int8_dynamic())  # in-place, input Float
+            quantize_(model, int8_dynamic())  # in-place
         except Exception:
             import warnings
             with warnings.catch_warnings():
@@ -371,14 +391,14 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 1):
                         model, {torch.nn.Linear}, dtype=torch.qint8
                     )
                 except Exception:
-                    pass  # tetap FP32 jika gagal
+                    pass
 
     model.eval()
 
     # Normalisasi id2label/label2id
-    cfg = model.config
-    id2label_raw = getattr(cfg, "id2label", {0: "positive", 1: "neutral", 2: "negative"})
-    label2id_raw = getattr(cfg, "label2id", {"positive": 0, "neutral": 1, "negative": 2})
+    cfg2 = model.config
+    id2label_raw = getattr(cfg2, "id2label", {0: "positive", 1: "neutral", 2: "negative"})
+    label2id_raw = getattr(cfg2, "label2id", {"positive": 0, "neutral": 1, "negative": 2})
     id2label = {int(k): _standardize_label(v) for k, v in (id2label_raw.items() if isinstance(id2label_raw, dict) else enumerate(id2label_raw))}
     label2id = {_standardize_label(k): int(v) for k, v in label2id_raw.items()}
     return tokenizer, model, device, id2label, label2id
@@ -408,9 +428,9 @@ mode_choice = st.sidebar.radio(
 _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
 
-# Bust cache via _v jika perlu reload (ubah angkanya bila kamu edit loader)
+# Bust cache via _v bila perlu
 tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-    quantize=use_quant_tmp, _v=2
+    quantize=use_quant_tmp, _v=3
 )
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 
@@ -418,16 +438,14 @@ page = st.session_state.page
 
 # ========= FAST Prediction utils =========
 def preencode_texts(texts: List[str]):
-    """Pre-encode seluruh teks (opsional), padding-8 hanya saat non-CPU."""
     cleaned = [preprocess_for_model(t) for t in texts]
     enc = tokenizer(
         cleaned, return_tensors='pt', truncation=True, padding=True,
         max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None)
     )
-    return enc  # tensors on CPU first
+    return enc
 
 def predict_from_preencoded(enc_all, batch_size=BATCH_SIZE, return_conf=False):
-    """Tersedia bila ingin gunakan pre-encode; evaluasi cepat pakai dynamic."""
     preds, confs = [], []
     total = enc_all["input_ids"].shape[0]
     for start in range(0, total, batch_size):
@@ -450,7 +468,7 @@ def predict_from_preencoded(enc_all, batch_size=BATCH_SIZE, return_conf=False):
     return (preds, confs) if return_conf else preds
 
 def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return_conf: bool = False):
-    """CEPAT: tokenize per-batch (dynamic padding by batch) + throttled UI."""
+    """Tokenize per-batch (dynamic padding) + throttled UI."""
     preds, confs = [], []
     prog = st.progress(0); info = st.empty()
     N = len(texts)
@@ -464,7 +482,7 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             batch_texts,
             return_tensors='pt',
             truncation=True,
-            padding=True,                # pad ke longest DI DALAM batch
+            padding=True,
             max_length=MAX_LEN,
             pad_to_multiple_of=(8 if device.type != "cpu" else None),
         )
@@ -488,8 +506,7 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
 
         processed += (end - start)
         if time.time() - last_ui > 0.25:
-            pct = int(processed / N * 100)
-            prog.progress(pct)
+            prog.progress(int(processed / N * 100))
             info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
             last_ui = time.time()
 
