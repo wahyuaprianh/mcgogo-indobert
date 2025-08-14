@@ -13,7 +13,7 @@ import torch.nn.functional as F
 # NLTK & Preproc
 import nltk
 from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
+from nltk.tokenize import ToktokTokenizer
 from nltk.probability import FreqDist
 from nltk import ngrams
 from wordcloud import WordCloud
@@ -39,6 +39,8 @@ APP_ID = "com.mobilechess.gp"
 LABEL_TO_INDEX = {'positive': 0, 'neutral': 1, 'negative': 2}
 INDEX_TO_LABEL = {v: k for k, v in LABEL_TO_INDEX.items()}
 VALID_LABELS = set(LABEL_TO_INDEX.keys())
+
+COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}  # konsisten di semua chart
 
 # ========= UI Helpers =========
 @st.cache_data
@@ -80,13 +82,13 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ========= NLTK Guards =========
+# ========= NLTK Guards (stopwords only; tidak perlu punkt/punkt_tab) =========
 @st.cache_data
 def ensure_nltk():
-    try: nltk.data.find('corpora/stopwords')
-    except LookupError: nltk.download('stopwords')
-    try: nltk.data.find('tokenizers/punkt')
-    except LookupError: nltk.download('punkt')
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        nltk.download('stopwords')
 ensure_nltk()
 
 # ========= Preprocessing =========
@@ -111,6 +113,11 @@ def load_stopwords():
             pass
     return sw
 LIST_STOPWORDS = load_stopwords()
+
+@st.cache_resource
+def get_tokenizer():
+    return ToktokTokenizer()
+TOKTOK = get_tokenizer()
 
 @st.cache_resource
 def load_stemmer():
@@ -141,7 +148,14 @@ def clean_review(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def tokenize(text): return word_tokenize(text)
+def tokenize(text: str):
+    text = "" if text is None else str(text)
+    try:
+        return list(TOKTOK.tokenize(text))
+    except Exception:
+        # fallback terakhir: regex huruf saja
+        return re.findall(r"[A-Za-z]+", text)
+
 def remove_stopwords(tokens): return [w for w in tokens if w not in LIST_STOPWORDS]
 def stem(tokens): return [STEMMER.stem(w) for w in tokens]
 def normalize(tokens): return [KAMUS_BAKU.get(t, t) for t in tokens]
@@ -259,7 +273,6 @@ if page == "Beranda":
 
     # ==== SINERGI + CAROUSEL (sesuai permintaan) ====
     st.subheader("Sinergi Hero Magic Chess Go Go")
-
     items = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
         {"title": "", "text": "", "img": "image/astro power.jpg"},
@@ -357,13 +370,24 @@ elif page == "Preprocessing":
             st.dataframe(df_raw[cols].head())
 
     if df_raw is not None and not df_raw.empty:
+        # Distribusi label valid, dengan warna konsisten
         if 'category' in df_raw.columns:
             tmp = df_raw[df_raw['category'].isin(VALID_LABELS)]
             if not tmp.empty:
                 st.subheader("➡️ Distribusi Sentimen Data Asli (label valid)")
-                counts = tmp['category'].value_counts().reindex(['positive','neutral','negative']).fillna(0)
-                fig = px.bar(x=counts.index, y=counts.values, labels={'x':'category','y':'count'},
-                             title='Distribusi Sentimen Data Asli')
+                counts = tmp['category'].value_counts()
+                # Susun urutan & warna
+                order = ['positive','neutral','negative']
+                counts = counts.reindex(order).fillna(0)
+                fig = px.bar(
+                    x=counts.index, y=counts.values,
+                    labels={'x':'category','y':'count'},
+                    title='Distribusi Sentimen Data Asli',
+                    color=counts.index,
+                    color_discrete_map=COLOR_MAP
+                )
+                # agar legend rapi
+                fig.update_layout(showlegend=False)
                 st.plotly_chart(fig, use_container_width=True)
 
         if st.button("🚀 Mulai Preprocessing", use_container_width=True):
@@ -376,6 +400,7 @@ elif page == "Preprocessing":
             if 'category' in dfp.columns: cols_show.append('category')
             st.dataframe(dfp[cols_show].head())
 
+            # Distribusi panjang
             st.subheader("➡️ Distribusi Panjang Ulasan")
             dfp['length_original'] = df_raw['review_text'].astype(str).apply(lambda s: len(s.split()))
             dfp['length_preprocessed'] = dfp['review_text_normalizedjoin'].astype(str).apply(lambda s: len(s.split()))
@@ -461,11 +486,15 @@ elif page == "Modeling & Evaluasi":
 
                     st.subheader("🔢 Confusion Matrix")
                     cm = confusion_matrix(y_true, y_pred, labels=[0,1,2])
-                    st.plotly_chart(px.imshow(
-                        cm, x=['positive','neutral','negative'], y=['positive','neutral','negative'],
-                        text_auto=True, labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
+                    fig_cm = px.imshow(
+                        cm,
+                        x=['positive','neutral','negative'],
+                        y=['positive','neutral','negative'],
+                        text_auto=True,
+                        labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
                         title="Confusion Matrix"
-                    ), use_container_width=True)
+                    )
+                    st.plotly_chart(fig_cm, use_container_width=True)
 
                     st.subheader("📝 Classification Report")
                     report = classification_report(y_true, y_pred,
@@ -475,10 +504,14 @@ elif page == "Modeling & Evaluasi":
 
                     st.subheader("🥧 Proporsi Sentimen Prediksi")
                     counts = df_eval['predicted_category'].value_counts()
-                    st.plotly_chart(px.pie(values=counts.values, names=counts.index,
-                                           title='Proporsi Sentimen Prediksi',
-                                           color_discrete_map={'positive':'green','negative':'red','neutral':'blue'}),
-                                    use_container_width=True)
+                    order = ['positive','neutral','negative']
+                    counts = counts.reindex(order).fillna(0)
+                    fig_pie = px.pie(
+                        values=counts.values, names=counts.index,
+                        title='Proporsi Sentimen Prediksi',
+                        color=counts.index, color_discrete_map=COLOR_MAP
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
     else:
         st.info("Silakan proses data di 'Preprocessing' atau unggah file yang sudah diproses.")
 
@@ -511,10 +544,14 @@ elif page == "Prediksi":
             st.dataframe(dfp[['review_text','predicted_category','confidence']].head())
 
             counts = dfp['predicted_category'].value_counts()
-            st.plotly_chart(px.pie(values=counts.values, names=counts.index,
-                                   title='Distribusi Sentimen Hasil Prediksi',
-                                   color_discrete_map={'positive':'green','negative':'red','neutral':'blue'}),
-                            use_container_width=True)
+            order = ['positive','neutral','negative']
+            counts = counts.reindex(order).fillna(0)
+            fig_pie = px.pie(
+                values=counts.values, names=counts.index,
+                title='Distribusi Sentimen Hasil Prediksi',
+                color=counts.index, color_discrete_map=COLOR_MAP
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
 
             st.download_button("Unduh Hasil Prediksi",
                                dfp.to_csv(index=False).encode('utf-8'),
