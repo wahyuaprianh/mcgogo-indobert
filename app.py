@@ -1,9 +1,9 @@
-# app.py — FINAL (Secrets-aware, Remote-first optional)
+# app.py — FINAL (Secrets-aware + patched loader + debug panel)
 # - Baca secrets via st.secrets (fallback os.environ)
-# - CPU override pakai MODEL_ID_CPU_OVERRIDE (FP32)
-# - Opsional: REMOTE_URL + REMOTE_TOKEN untuk inference via GPU endpoint
-# - Label map dinamis + override via LABEL_MAP
-# - Fitur: scraping, preprocessing, evaluasi, prediksi batch & single
+# - MODEL_ID_CPU_OVERRIDE untuk paksa model FP32 di CPU
+# - Opsional REMOTE_URL + REMOTE_TOKEN (endpoint GPU)
+# - Opsional HF_TOKEN (kalau repo HF private)
+# - Panel debug untuk melihat secrets & catatan error loader
 
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
@@ -29,13 +29,16 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default) or default
 
 # ================== ENV (REMOTE/LOCAL) ==================
+MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
+MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
+LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
+
 REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
 REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
 USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 
-MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
-MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
-LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
+HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo private
+AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
 # ================== Threading & Perf ==================
 try:
@@ -80,7 +83,16 @@ APP_ID = "com.mobilechess.gp"
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
-DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # urutan untuk chart
+DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]
+
+# ====== Panel kecil untuk cek Secrets ======
+with st.sidebar.expander("🔎 Secrets debug", expanded=False):
+    st.write({
+        "MODEL_ID_CPU_OVERRIDE": MODEL_ID_CPU_OVERRIDE,
+        "USE_REMOTE": USE_REMOTE,
+        "HF_TOKEN_set": bool(HF_TOKEN),
+        "LABEL_MAP": LABEL_MAP_RAW
+    })
 
 # ========= UI Helpers =========
 @st.cache_data
@@ -346,10 +358,11 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
-# ========= Local Loader (dipakai jika USE_REMOTE=False) =========
+# ========= Loader (patched) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 6):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 7):
     use_cuda = torch.cuda.is_available()
+
     cpu_candidates = []
     if MODEL_ID_CPU_OVERRIDE:
         cpu_candidates.append(MODEL_ID_CPU_OVERRIDE)
@@ -359,48 +372,51 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 6):
     cpu_candidates += ["indobenchmark/indobert-base-p1", "indolem/indobert-base-uncased"]
 
     model = None; device = None; final_model_id = MODEL_ID; loaded_bnb_8bit = False
+    errors = []
 
     if use_cuda:
         try:
-            model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto")
+            model = BertForSequenceClassification.from_pretrained(MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH)
             device = next(model.parameters()).device; loaded_bnb_8bit = True; final_model_id = MODEL_ID
-        except Exception:
+        except Exception as e:
+            errors.append(f"cuda 8bit load failed: {e}")
             try:
-                cfg = AutoConfig.from_pretrained(MODEL_ID)
+                cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
                 if hasattr(cfg, "quantization_config"):
                     try: delattr(cfg, "quantization_config")
                     except: pass
                     try: cfg.__dict__.pop("quantization_config", None)
                     except: pass
-                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
+                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
                 device = torch.device("cuda"); model.to(device); final_model_id = MODEL_ID
-            except Exception:
+            except Exception as e2:
+                errors.append(f"cuda fp32 load failed: {e2}")
                 base_id = "indobenchmark/indobert-base-p1"
-                cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
-                model = BertForSequenceClassification.from_pretrained(base_id, config=cfg)
+                cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
+                model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, **AUTH)
                 device = torch.device("cuda"); model.to(device); final_model_id = base_id
     else:
         for cand in cpu_candidates:
             try:
-                cfg = AutoConfig.from_pretrained(cand)
+                cfg = AutoConfig.from_pretrained(cand, **AUTH)
                 if hasattr(cfg, "quantization_config"):
                     try: delattr(cfg, "quantization_config")
                     except: pass
                     try: cfg.__dict__.pop("quantization_config", None)
                     except: pass
                 if getattr(cfg, "num_labels", None) != 3: cfg.num_labels = 3
-                model = BertForSequenceClassification.from_pretrained(cand, config=cfg, torch_dtype=torch.float32)
+                model = BertForSequenceClassification.from_pretrained(cand, config=cfg, torch_dtype=torch.float32, **AUTH)
                 device = torch.device("cpu"); model.to(device); model.float(); final_model_id = cand
                 break
-            except Exception:
+            except Exception as e:
+                errors.append(f"cpu load failed for {cand}: {e}")
                 continue
         if model is None:
             base_id = "indobenchmark/indobert-base-p1"
-            cfg = AutoConfig.from_pretrained(base_id, num_labels=3)
-            model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, torch_dtype=torch.float32)
+            cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
+            model = BertForSequenceClassification.from_pretrained(base_id, config=cfg, torch_dtype=torch.float32, **AUTH)
             device = torch.device("cpu"); model.to(device); model.float(); final_model_id = base_id
 
-    # Quantize CPU (torchao) optional
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
@@ -418,30 +434,35 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 6):
 
     # Tokenizer
     try:
-        tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True)
+        tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH)
     except Exception:
-        tokenizer = BertTokenizer.from_pretrained(final_model_id)
+        tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
     # Label map dari config
     try:
-        id2label = {int(k): _standardize_label(v) for k,v in model.config.id2label.items()}
+        id2label = {int(k): (str(v).lower()) for k, v in model.config.id2label.items()}
         label2id = {v:k for k,v in id2label.items()}
         if len(id2label) != getattr(model.config, "num_labels", 3): raise KeyError
     except Exception:
-        id2label = DEFAULT_ID2LABEL.copy(); label2id = {v:k for k,v in id2label.items()}
+        id2label = {0:"negative",1:"neutral",2:"positive"}
+        label2id = {v:k for k,v in id2label.items()}
 
     # Override dari LABEL_MAP
-    override = LABEL_MAP_RAW
-    if override:
-        for pair in override.split(","):
-            i, name = pair.split(":", 1)
-            id2label[int(i)] = _standardize_label(name)
-        label2id = {v:k for k,v in id2label.items()}
+    if LABEL_MAP_RAW:
+        try:
+            for pair in LABEL_MAP_RAW.split(","):
+                i, name = pair.split(":", 1)
+                id2label[int(i)] = str(name).strip().lower()
+            label2id = {v:k for k,v in id2label.items()}
+        except Exception as e:
+            errors.append(f"LABEL_MAP parse failed: {e}")
 
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
+        if errors:
+            st.warning("Load notes:\n- " + "\n- ".join(errors))
 
     return tokenizer, model, device, id2label, label2id
 
@@ -472,7 +493,9 @@ if USE_REMOTE:
 else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
-    tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(quantize=use_quant_tmp, _v=6)
+    tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
+        quantize=use_quant_tmp, _v=7  # bust cache saat perlu
+    )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 page = st.session_state.page
@@ -622,7 +645,7 @@ elif page == "Scraping Data":
                             if 'content' in df.columns: df = df.rename(columns={'content':'review_text'})
                             elif 'review_text' not in df.columns: df['review_text'] = df.get('body', '')
                             if 'at' in df.columns: df = df.drop(columns=['at'])
-                            st.success(f"✅ Berhasil mengambil {len(df)} ulasan dari batch terbaru.")
+                            st.success(f"✅ Berhasil mengambil {len[df]} ulasan dari batch terbaru.")
                             st.dataframe(df[['review_text','category','score','timestamp']].head())
                             st.session_state.df_scraped = df
                             st.download_button("Unduh Hasil Scraping", df.to_csv(index=False).encode('utf-8'), "scraped_data.csv", "text/csv")
