@@ -1,8 +1,9 @@
-# app.py — FINAL (Strict override + Secrets-aware + debug panel + AUTO-DETECT LABELS + Robust Single Prediction)
+# app.py — FINAL (strict override + secrets-aware + auto-detect labels + robust single prediction + contrast-aware)
 
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
 from functools import lru_cache
+from itertools import permutations
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,6 @@ import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import requests
-from itertools import permutations  # auto-detect mapping
 
 # ---------------- Secrets helper ----------------
 def get_secret(name: str, default: str = "") -> str:
@@ -37,11 +37,17 @@ HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF priv
 AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
 # --- Single-pred tuning (with sensible defaults) ---
-TEMP = float(get_secret("TEMP", "1.2"))
-CONF_MIN = float(get_secret("CONF_MIN", "0.60"))
-NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))
-SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))
-STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))
+TEMP = float(get_secret("TEMP", "1.2"))             # temperature scaling
+CONF_MIN = float(get_secret("CONF_MIN", "0.60"))     # confidence min untuk fallback bintang
+NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))  # margin top-2
+SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))       # paksa single pakai 512
+STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))      # overlap chunk
+
+# Kata penghubung KONTRAS yang sering muncul di ulasan ID
+CONTRAST_CUES = [
+    "tetapi", "tapi", "namun", "akan tetapi",
+    "semenjak", "sejak", "sayangnya", "padahal"
+]
 
 # ================== Threading & Perf ==================
 try:
@@ -95,7 +101,12 @@ with st.sidebar.expander("🔎 Secrets debug", expanded=False):
         "MODEL_ID_CPU_OVERRIDE": MODEL_ID_CPU_OVERRIDE,
         "USE_REMOTE": USE_REMOTE,
         "HF_TOKEN_set": bool(HF_TOKEN),
-        "LABEL_MAP": LABEL_MAP_RAW
+        "LABEL_MAP": LABEL_MAP_RAW,
+        "TEMP": TEMP,
+        "CONF_MIN": CONF_MIN,
+        "NEUTRAL_MARGIN": NEUTRAL_MARGIN,
+        "SINGLE_MAXLEN": SINGLE_MAXLEN,
+        "STRIDE_RATIO": STRIDE_RATIO
     })
 
 # ========= UI Helpers =========
@@ -364,7 +375,7 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
 
 # ========= Loader (STRICT OVERRIDE) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 10):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -463,7 +474,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):
         id2label = {0: "negative", 1: "neutral", 2: "positive"}
         label2id = {v: k for k, v in id2label.items()}
 
-    if LABEL_MAP_RAW:
+    if LABEL_MAP_RAW:  # hati-hati: ini override config repo
         for pair in LABEL_MAP_RAW.split(","):
             i, name = pair.split(":", 1)
             id2label[int(i)] = str(name).strip().lower()
@@ -504,11 +515,21 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=9
+        quantize=use_quant_tmp, _v=10
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 page = st.session_state.page
+
+# ====== mapping override helpers ======
+def set_label_override(id2label_new: dict):
+    st.session_state.ID2LABEL_override = {int(k): str(v).lower() for k, v in id2label_new.items()}
+    st.session_state.LABEL2ID_override = {v: k for k, v in st.session_state.ID2LABEL_override.items()}
+
+def get_active_maps():
+    id2 = st.session_state.get("ID2LABEL_override", ID2LABEL)
+    lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
+    return id2, lab2
 
 # ========= Prediksi batch utility =========
 def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return_conf: bool = False):
@@ -560,7 +581,7 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
     prog.progress(100)
     return (preds, confs) if return_conf else preds
 
-# ==== Robust single-text prediction (chunking + weighted average) ====
+# ==== Robust single-text prediction (chunking + temperature + neutral margin + star fallback) ====
 def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0.5):
     """Split text into token-id chunks dengan overlap; selalu tambah [CLS]/[SEP]."""
     if USE_REMOTE:
@@ -571,7 +592,6 @@ def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0
     ids = tokenizer.encode(preprocess_for_model(text), add_special_tokens=False)
     if len(ids) <= body_max:
         return [tokenizer.build_inputs_with_special_tokens(ids)]
-    # overlap
     stride = max(16, int(body_max * stride_ratio))
     step = max(1, body_max - stride)
     chunks = []
@@ -589,7 +609,7 @@ def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0
 def predict_single_robust(text: str, star_score: Optional[int] = None):
     """
     Single prediction kuat:
-    - pakai max_len 512 (SINGLE_MAXLEN) & overlap STRIDE_RATIO
+    - pakai SINGLE_MAXLEN & overlap STRIDE_RATIO
     - temperature scaling (TEMP)
     - netral jika margin kecil (NEUTRAL_MARGIN)
     - fallback ke bintang (1/2=neg, 3=neu, 4/5=pos) jika confidence < CONF_MIN
@@ -612,27 +632,24 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
         for ids in ids_chunks:
             input_ids = torch.tensor([ids], device=device)
             attn = torch.ones_like(input_ids)
-            # temperature scaling
             logits = model(input_ids=input_ids, attention_mask=attn).logits
-            logits = logits / max(1e-6, TEMP)
+            logits = logits / max(1e-6, TEMP)  # temperature scaling
             probs = F.softmax(logits, dim=-1).float().cpu().squeeze(0)  # (C,)
-            # bobot = panjang chunk (tanpa [CLS]/[SEP])
-            w = max(1, input_ids.shape[1] - 2)
+            w = max(1, input_ids.shape[1] - 2)  # bobot = panjang chunk (tanpa CLS/SEP)
             probs_sum += probs * w
             weight_sum += w
 
     avg_probs = (probs_sum / max(1.0, weight_sum)).numpy()
-    # netral jika margin kecil
     top2 = np.argsort(-avg_probs)[:2]
     top, second = int(top2[0]), int(top2[1])
     top_p, second_p = float(avg_probs[top]), float(avg_probs[second])
     pred = ACTIVE_ID2LABEL.get(top, "neutral")
     conf = top_p * 100.0
 
-    # aturan netral
+    # aturan netral (margin kecil)
     if (top_p - second_p) < NEUTRAL_MARGIN:
         pred = "neutral"
-        conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)  # kosmetik
+        conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)
 
     # fallback ke bintang jika disediakan & confidence rendah
     if star_score is not None and conf < (CONF_MIN * 100.0):
@@ -645,9 +662,45 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
 
     return pred, conf
 
-# === Auto-detect label order (helper) ===
+# ==== Contrast-aware wrapper ====
+def _extract_after_contrast(text: str) -> Optional[str]:
+    """Ambil bagian sesudah kata kontras pertama (jika ada)."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    best = None
+    best_pos = 10**9
+    for cue in CONTRAST_CUES:
+        i = low.find(cue)
+        if i != -1 and i < best_pos:
+            best_pos = i
+            best = cue
+    if best is None:
+        return None
+    j = best_pos + len(best)
+    tail = t[j:].strip(" ,.:;!?\n\t-—")
+    return tail if len(tail.split()) >= 5 else None
+
+def predict_single_with_contrast(text: str, star_score: Optional[int] = None):
+    """
+    Jika ada kata kontras (tetapi/tapi/namun/…),
+    utamakan prediksi pada bagian *setelah* kontras.
+    Jika hasil tail negatif (conf ≥55%) atau netral (conf ≥60%) → pakai.
+    Jika tail positif (conf ≥70%) → boleh pakai.
+    Jika tidak, fallback ke prediksi robust seluruh teks.
+    """
+    tail = _extract_after_contrast(text)
+    if tail:
+        pred_tail, conf_tail = predict_single_robust(tail, star_score=star_score)
+        if (pred_tail == "negative" and conf_tail >= 55.0) or (pred_tail == "neutral" and conf_tail >= 60.0):
+            return pred_tail, conf_tail
+        if pred_tail == "positive" and conf_tail >= 70.0:
+            return pred_tail, conf_tail
+    return predict_single_robust(text, star_score=star_score)
+
+# === Auto-detect label order (untuk evaluasi) ===
 def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
-    """Prediksi ID kelas (0/1/2) tanpa memetakan ke nama label."""
     preds = []
     N = len(texts)
     for start in range(0, N, batch_size):
@@ -683,19 +736,10 @@ def autodetect_label_mapping(df_labeled: pd.DataFrame, sample_n: int = 500):
     detected = {0: best_perm[0], 1: best_perm[1], 2: best_perm[2]}
     return detected, float(best_acc)
 
-def set_label_override(id2label_new: dict):
-    st.session_state.ID2LABEL_override = {int(k): str(v).lower() for k, v in id2label_new.items()}
-    st.session_state.LABEL2ID_override = {v: k for k, v in st.session_state.ID2LABEL_override.items()}
-
-def get_active_maps():
-    id2 = st.session_state.get("ID2LABEL_override", ID2LABEL)
-    lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
-    return id2, lab2
-
 # ========= Page Layout =========
 st.markdown('<div class="main-card">', unsafe_allow_html=True)
 
-if page == "Beranda":
+if st.session_state.page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
     try:
         st.image("image/home.jpg", use_container_width=True)
@@ -739,7 +783,7 @@ if page == "Beranda":
     except Exception as e:
         st.warning(f"Carousel tidak dapat ditampilkan: {e}. Pastikan file gambarnya ada.")
 
-elif page == "Scraping Data":
+elif st.session_state.page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
     st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
     col1, col2 = st.columns(2)
@@ -796,7 +840,7 @@ elif page == "Scraping Data":
             except Exception as e:
                 st.error(f"Gagal mengambil data: {e}")
 
-elif page == "Preprocessing":
+elif st.session_state.page == "Preprocessing":
     st.header("🧹 Preprocessing Data Ulasan")
     df_raw = None
     if 'df_scraped' in st.session_state and not getattr(st.session_state, "df_scraped", pd.DataFrame()).empty:
@@ -858,7 +902,7 @@ elif page == "Preprocessing":
     else:
         st.info("Silakan unggah atau scraping data terlebih dahulu.")
 
-elif page == "Modeling & Evaluasi":
+elif st.session_state.page == "Modeling & Evaluasi":
     st.header("📊 Modeling & Evaluasi IndoBERT")
     df_eval = None
     if 'df_preprocessed' in st.session_state:
@@ -876,15 +920,15 @@ elif page == "Modeling & Evaluasi":
                 st.warning("Tidak ada baris dengan label valid untuk evaluasi.")
             else:
                 st.dataframe(df_eval.head())
-                if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
 
+                if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
                     # --- Auto-detect urutan label pada sampel berlabel ---
                     df_labeled = df_eval[df_eval['category'].isin(VALID_LABELS)]
                     with st.spinner("🔧 Mencari urutan label terbaik (auto-detect)..."):
                         detected_map, probe_acc = autodetect_label_mapping(df_labeled, sample_n=500)
                     set_label_override(detected_map)
 
-                    with st.sidebar.expander("🧭 Active label map", expanded=True):
+                    with st.sidebar.expander("🧭 Active label map (detected)", expanded=True):
                         st.write({"detected_map": detected_map, "probe_acc": round(probe_acc, 4)})
 
                     texts = df_eval['review_text'].astype(str).tolist()
@@ -914,8 +958,9 @@ elif page == "Modeling & Evaluasi":
     else:
         st.info("Silakan proses data di 'Preprocessing' atau unggah file yang sudah diproses.")
 
-elif page == "Prediksi":
+elif st.session_state.page == "Prediksi":
     st.header("🔮 Prediksi Sentimen")
+
     st.subheader("Prediksi dari Data yang Diproses")
     if 'df_preprocessed' in st.session_state and not st.session_state.df_preprocessed.empty:
         if st.button("Mulai Prediksi Batch", use_container_width=True):
@@ -935,9 +980,12 @@ elif page == "Prediksi":
 
     st.subheader("Prediksi Ulasan Tunggal")
     user_input = st.text_area("Masukkan ulasan:", height=150)
+    star_opt = st.selectbox("(Opsional) Rating bintang ulasan:", ["Tidak ada", "★1", "★2", "★3", "★4", "★5"], index=0)
+    star_val = None if star_opt == "Tidak ada" else int(star_opt.replace("★",""))
+
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
-            predicted, conf = predict_single_robust(user_input)
+            predicted, conf = predict_single_with_contrast(user_input, star_score=star_val)
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
@@ -945,9 +993,13 @@ elif page == "Prediksi":
         else:
             st.warning("Mohon masukkan ulasan untuk dianalisis.")
 
-# Tampilkan mapping aktif saat ini (debug)
+# Tampilkan mapping aktif saat ini (debug) + tombol reset
 with st.sidebar.expander("🧭 Active label map", expanded=False):
     cur_id2, _ = get_active_maps()
     st.write(cur_id2)
+    if st.button("Reset label map override"):
+        st.session_state.pop("ID2LABEL_override", None)
+        st.session_state.pop("LABEL2ID_override", None)
+        st.experimental_rerun()
 
 st.markdown('</div>', unsafe_allow_html=True)
