@@ -829,7 +829,7 @@ elif page == "Modeling & Evaluasi":
         if up is not None:
             df_eval = pd.read_csv(up, sep='\t' if up.name.endswith('.tsv') else ',')
     if df_eval is not None and not df_eval.empty:
-        if 'review_text' not in df_eval.columns atau 'category' not in df_eval.columns:
+        if 'review_text' not in df_eval.columns or 'category' not in df_eval.columns:
             st.error("File harus memiliki kolom 'review_text' dan 'category'.")
         else:
             df_eval = df_eval[df_eval['category'].isin(VALID_LABELS)].reset_index(drop=True)
