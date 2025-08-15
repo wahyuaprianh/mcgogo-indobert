@@ -1,9 +1,4 @@
-# app.py — FINAL (Strict override + Secrets-aware + debug panel + AUTO-DETECT LABELS)
-# - Pakai MODEL_ID_CPU_OVERRIDE (FP32) dari Secrets untuk CPU. Jika gagal load, tampilkan error & stop (tidak fallback).
-# - Opsional REMOTE_URL + REMOTE_TOKEN untuk inference endpoint (jika ingin pakai GPU remote).
-# - Opsional HF_TOKEN untuk akses repo private di Hugging Face.
-# - Auto-detect urutan label (uji 6 permutasi) saat evaluasi agar tak kebalik.
-# - Halaman: Beranda, Scraping Data, Preprocessing, Modeling & Evaluasi, Prediksi.
+# app.py — FINAL (Strict override + Secrets-aware + debug panel + AUTO-DETECT LABELS + Robust Single Prediction)
 
 import os, re, base64, time, datetime
 from typing import Optional, Tuple, List
@@ -17,7 +12,7 @@ import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import requests
-from itertools import permutations  # <— untuk auto-detect mapping
+from itertools import permutations  # auto-detect mapping
 
 # ---------------- Secrets helper ----------------
 def get_secret(name: str, default: str = "") -> str:
@@ -85,7 +80,7 @@ COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
 DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]
-LABEL_NAMES = ["positive","neutral","negative"]  # untuk auto-detect
+LABEL_NAMES = ["positive","neutral","negative"]
 
 # ====== Panel kecil untuk cek Secrets ======
 with st.sidebar.expander("🔎 Secrets debug", expanded=False):
@@ -362,9 +357,7 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
 
 # ========= Loader (STRICT OVERRIDE) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to bust cache
-    from transformers import BertTokenizer, BertForSequenceClassification, AutoConfig
-
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -373,11 +366,9 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
     device = None
     final_model_id = None
 
-    # 1) PRIORITAS: pakai MODEL_ID_CPU_OVERRIDE apa pun yang terjadi
     if MODEL_ID_CPU_OVERRIDE:
         try:
             cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH)
-            # buang jejak quantization di config kalau ada
             if hasattr(cfg, "quantization_config"):
                 try: delattr(cfg, "quantization_config")
                 except: pass
@@ -386,7 +377,6 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
             if getattr(cfg, "num_labels", None) != 3:
                 cfg.num_labels = 3
 
-            # CPU path (Streamlit Cloud)
             model = BertForSequenceClassification.from_pretrained(
                 MODEL_ID_CPU_OVERRIDE, config=cfg, torch_dtype=torch.float32, **AUTH
             )
@@ -397,16 +387,11 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
 
         except Exception as e:
             errors.append(f"OVERRIDE load failed for {MODEL_ID_CPU_OVERRIDE}: {e}")
-
-            # tampilkan error & JANGAN fallback
             with st.sidebar.expander("⚙ Model Info", expanded=True):
                 st.error(f"Gagal memuat MODEL_ID_CPU_OVERRIDE = `{MODEL_ID_CPU_OVERRIDE}`")
-                if errors:
-                    st.write("Load notes:")
-                    st.code("\n".join(errors))
-            st.stop()  # hentikan app di sini supaya penyebab terlihat jelas
+                if errors: st.code("\n".join(errors))
+            st.stop()
 
-    # 2) Jika tidak ada override (atau kamu hapus st.stop di atas), jalan normal
     if model is None:
         if use_cuda:
             try:
@@ -431,7 +416,6 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
                     final_model_id = MODEL_ID
                 except Exception as e2:
                     errors.append(f"cuda fp32 load failed: {e2}")
-        # CPU fallback ke base jika semua gagal & tidak ada override
         if model is None:
             base_id = "indobenchmark/indobert-base-p1"
             cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
@@ -443,7 +427,6 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
             model.float()
             final_model_id = base_id
 
-    # Quantization CPU opsional
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
@@ -459,13 +442,11 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
 
     model.eval()
 
-    # Tokenizer
     try:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
-    # Label map dari config
     try:
         id2label = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
         label2id = {v: k for k, v in id2label.items()}
@@ -475,7 +456,6 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to
         id2label = {0: "negative", 1: "neutral", 2: "positive"}
         label2id = {v: k for k, v in id2label.items()}
 
-    # Override LABEL_MAP (secrets)
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
             i, name = pair.split(":", 1)
@@ -517,13 +497,13 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=9  # bust cache saat perlu
+        quantize=use_quant_tmp, _v=9
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
 page = st.session_state.page
 
-# ========= Prediksi utility =========
+# ========= Prediksi batch utility =========
 def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return_conf: bool = False):
     if USE_REMOTE:
         preds, confs = [], []
@@ -538,7 +518,6 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
         return (preds, confs) if return_conf else preds
 
-    # Gunakan mapping aktif (override jika sudah autodetect)
     ACTIVE_ID2LABEL, _ = get_active_maps()
 
     preds, confs = [], []
@@ -574,6 +553,59 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
     prog.progress(100)
     return (preds, confs) if return_conf else preds
 
+# ==== Robust single-text prediction (chunking + weighted average) ====
+def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0.5):
+    """Split text into token-id chunks with [CLS]/[SEP]."""
+    if USE_REMOTE:
+        return []  # tidak dipakai untuk remote
+    if max_len is None:
+        max_len = MAX_LEN
+    body_max = max_len - 2
+    ids = tokenizer.encode(preprocess_for_model(text), add_special_tokens=False)
+    if len(ids) <= body_max:
+        return [tokenizer.build_inputs_with_special_tokens(ids)]
+    stride = max(32, int(body_max * stride_ratio))
+    step = max(1, body_max - stride)
+    chunks = []
+    for i in range(0, len(ids), step):
+        body = ids[i:i + body_max]
+        if not body:
+            break
+        chunks.append(tokenizer.build_inputs_with_special_tokens(body))
+        if i + body_max >= len(ids):
+            break
+    return chunks
+
+def predict_single_robust(text: str):
+    """Prediksi tunggal yang tahan teks panjang: rata-rata probabilitas per chunk (berbobot panjang)."""
+    if USE_REMOTE:
+        p, c = remote_predict_batch([text], return_conf=True)
+        return p[0], c[0]
+
+    ACTIVE_ID2LABEL, _ = get_active_maps()
+    ids_chunks = _chunk_ids_for_model(text, max_len=MAX_LEN, stride_ratio=0.5)
+    if not ids_chunks:  # fallback
+        ids_chunks = [tokenizer.encode(preprocess_for_model(text), add_special_tokens=True)]
+
+    probs_sum = torch.zeros((1, len(ACTIVE_ID2LABEL)), dtype=torch.float32)
+    weight_sum = 0.0
+
+    with torch.inference_mode():
+        for ids in ids_chunks:
+            input_ids = torch.tensor([ids], device=device)
+            attn = torch.ones_like(input_ids)
+            logits = model(input_ids=input_ids, attention_mask=attn).logits
+            probs = F.softmax(logits, dim=-1).float().cpu()  # 1 x C
+            w = max(1, input_ids.shape[1] - 2)
+            probs_sum += probs * w
+            weight_sum += w
+
+    avg_probs = (probs_sum / max(1.0, weight_sum)).squeeze(0).numpy()
+    lid = int(avg_probs.argmax())
+    conf = float(avg_probs[lid] * 100.0)
+    predicted = ACTIVE_ID2LABEL.get(lid, "unknown")
+    return predicted, conf
+
 # === Auto-detect label order (helper) ===
 def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
     """Prediksi ID kelas (0/1/2) tanpa memetakan ke nama label."""
@@ -594,13 +626,9 @@ def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int
     return preds
 
 def autodetect_label_mapping(df_labeled: pd.DataFrame, sample_n: int = 500):
-    """
-    Uji semua permutasi label & pilih yang akurasinya paling tinggi pada sampel berlabel.
-    Mengembalikan dict {0:...,1:...,2:...} + akurasi probe.
-    """
+    """Uji semua permutasi label & pilih yang akurasinya paling tinggi pada sampel berlabel."""
     if df_labeled.empty:
         return {0:"positive",1:"neutral",2:"negative"}, 0.0
-
     samp = df_labeled.sample(n=min(sample_n, len(df_labeled)), random_state=42)
     texts = samp["review_text"].astype(str).tolist()
     true_labels = samp["category"].str.lower().tolist()
@@ -608,23 +636,19 @@ def autodetect_label_mapping(df_labeled: pd.DataFrame, sample_n: int = 500):
 
     y_true = np.array(true_labels)
     best_perm, best_acc = None, -1.0
-
-    for perm in permutations(LABEL_NAMES):  # contoh: ('positive','neutral','negative')
+    for perm in permutations(LABEL_NAMES):
         mapped = np.array([perm[i] for i in pred_ids])
         acc = (mapped == y_true).mean()
         if acc > best_acc:
             best_acc, best_perm = acc, perm
-
     detected = {0: best_perm[0], 1: best_perm[1], 2: best_perm[2]}
     return detected, float(best_acc)
 
 def set_label_override(id2label_new: dict):
-    """Simpan mapping terdeteksi ke session_state agar dipakai app seluruhnya."""
     st.session_state.ID2LABEL_override = {int(k): str(v).lower() for k, v in id2label_new.items()}
     st.session_state.LABEL2ID_override = {v: k for k, v in st.session_state.ID2LABEL_override.items()}
 
 def get_active_maps():
-    """Kembalikan mapping aktif (override kalau ada; kalau tidak, pakai dari model)."""
     id2 = st.session_state.get("ID2LABEL_override", ID2LABEL)
     lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
     return id2, lab2
@@ -805,7 +829,7 @@ elif page == "Modeling & Evaluasi":
         if up is not None:
             df_eval = pd.read_csv(up, sep='\t' if up.name.endswith('.tsv') else ',')
     if df_eval is not None and not df_eval.empty:
-        if 'review_text' not in df_eval.columns or 'category' not in df_eval.columns:
+        if 'review_text' not in df_eval.columns atau 'category' not in df_eval.columns:
             st.error("File harus memiliki kolom 'review_text' dan 'category'.")
         else:
             df_eval = df_eval[df_eval['category'].isin(VALID_LABELS)].reset_index(drop=True)
@@ -874,24 +898,7 @@ elif page == "Prediksi":
     user_input = st.text_area("Masukkan ulasan:", height=150)
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
-            if USE_REMOTE:
-                preds, confs = remote_predict_batch([user_input], return_conf=True)
-                predicted, conf = preds[0], confs[0]
-            else:
-                text_for_model = preprocess_for_model(user_input)
-                enc = tokenizer(text_for_model, return_tensors='pt', truncation=True, padding=True,
-                                max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None))
-                enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
-                with torch.inference_mode():
-                    if device.type == "cuda":
-                        with torch.autocast('cuda', dtype=torch.float16):
-                            logits = model(**enc).logits
-                    else:
-                        logits = model(**enc).logits
-                    probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
-                    lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
-                    ACTIVE_ID2LABEL, _ = get_active_maps()
-                    predicted = ACTIVE_ID2LABEL.get(lid, "unknown")
+            predicted, conf = predict_single_robust(user_input)
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
