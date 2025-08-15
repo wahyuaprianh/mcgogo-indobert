@@ -1,7 +1,8 @@
-# app.py — FINAL (Strict override + Secrets-aware + debug panel)
+# app.py — FINAL (Strict override + Secrets-aware + debug panel + AUTO-DETECT LABELS)
 # - Pakai MODEL_ID_CPU_OVERRIDE (FP32) dari Secrets untuk CPU. Jika gagal load, tampilkan error & stop (tidak fallback).
 # - Opsional REMOTE_URL + REMOTE_TOKEN untuk inference endpoint (jika ingin pakai GPU remote).
 # - Opsional HF_TOKEN untuk akses repo private di Hugging Face.
+# - Auto-detect urutan label (uji 6 permutasi) saat evaluasi agar tak kebalik.
 # - Halaman: Beranda, Scraping Data, Preprocessing, Modeling & Evaluasi, Prediksi.
 
 import os, re, base64, time, datetime
@@ -16,6 +17,7 @@ import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import requests
+from itertools import permutations  # <— untuk auto-detect mapping
 
 # ---------------- Secrets helper ----------------
 def get_secret(name: str, default: str = "") -> str:
@@ -83,6 +85,7 @@ COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
 DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]
+LABEL_NAMES = ["positive","neutral","negative"]  # untuk auto-detect
 
 # ====== Panel kecil untuk cek Secrets ======
 with st.sidebar.expander("🔎 Secrets debug", expanded=False):
@@ -359,7 +362,7 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
 
 # ========= Loader (STRICT OVERRIDE) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 8):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 9):  # bump _v to bust cache
     from transformers import BertTokenizer, BertForSequenceClassification, AutoConfig
 
     errors = []
@@ -483,8 +486,6 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 8):
         st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
-        if errors:
-            st.warning("Load notes:\n- " + "\n- ".join(errors))
 
     return tokenizer, model, device, id2label, label2id
 
@@ -516,7 +517,7 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=8  # bust cache saat perlu
+        quantize=use_quant_tmp, _v=9  # bust cache saat perlu
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -536,6 +537,9 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             prog.progress(int(processed / N * 100))
             info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
         return (preds, confs) if return_conf else preds
+
+    # Gunakan mapping aktif (override jika sudah autodetect)
+    ACTIVE_ID2LABEL, _ = get_active_maps()
 
     preds, confs = [], []
     prog = st.progress(0); info = st.empty()
@@ -557,11 +561,11 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             if return_conf:
                 probs = F.softmax(logits, dim=-1)
                 pred_ids = probs.argmax(dim=-1).tolist()
-                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+                preds.extend([ACTIVE_ID2LABEL.get(int(i), "unknown") for i in pred_ids])
                 confs.extend((probs.max(dim=-1).values * 100).tolist())
             else:
                 pred_ids = logits.argmax(dim=-1).tolist()
-                preds.extend([ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+                preds.extend([ACTIVE_ID2LABEL.get(int(i), "unknown") for i in pred_ids])
         processed += (end - start)
         if time.time() - last_ui > 0.25:
             prog.progress(int(processed / N * 100))
@@ -569,6 +573,61 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             last_ui = time.time()
     prog.progress(100)
     return (preds, confs) if return_conf else preds
+
+# === Auto-detect label order (helper) ===
+def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
+    """Prediksi ID kelas (0/1/2) tanpa memetakan ke nama label."""
+    preds = []
+    N = len(texts)
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        batch_texts = [preprocess_for_model(t) for t in texts[start:end]]
+        enc = tokenizer(
+            batch_texts, return_tensors='pt', truncation=True, padding=True,
+            max_length=MAX_LEN, pad_to_multiple_of=(8 if device.type != "cpu" else None),
+        )
+        enc = {k: v.to(device, non_blocking=True) for k, v in enc.items()}
+        with torch.inference_mode():
+            logits = model(**enc).logits
+            pred_ids = logits.argmax(dim=-1).detach().cpu().tolist()
+            preds.extend(pred_ids)
+    return preds
+
+def autodetect_label_mapping(df_labeled: pd.DataFrame, sample_n: int = 500):
+    """
+    Uji semua permutasi label & pilih yang akurasinya paling tinggi pada sampel berlabel.
+    Mengembalikan dict {0:...,1:...,2:...} + akurasi probe.
+    """
+    if df_labeled.empty:
+        return {0:"positive",1:"neutral",2:"negative"}, 0.0
+
+    samp = df_labeled.sample(n=min(sample_n, len(df_labeled)), random_state=42)
+    texts = samp["review_text"].astype(str).tolist()
+    true_labels = samp["category"].str.lower().tolist()
+    pred_ids = predict_ids_only(texts)
+
+    y_true = np.array(true_labels)
+    best_perm, best_acc = None, -1.0
+
+    for perm in permutations(LABEL_NAMES):  # contoh: ('positive','neutral','negative')
+        mapped = np.array([perm[i] for i in pred_ids])
+        acc = (mapped == y_true).mean()
+        if acc > best_acc:
+            best_acc, best_perm = acc, perm
+
+    detected = {0: best_perm[0], 1: best_perm[1], 2: best_perm[2]}
+    return detected, float(best_acc)
+
+def set_label_override(id2label_new: dict):
+    """Simpan mapping terdeteksi ke session_state agar dipakai app seluruhnya."""
+    st.session_state.ID2LABEL_override = {int(k): str(v).lower() for k, v in id2label_new.items()}
+    st.session_state.LABEL2ID_override = {v: k for k, v in st.session_state.ID2LABEL_override.items()}
+
+def get_active_maps():
+    """Kembalikan mapping aktif (override kalau ada; kalau tidak, pakai dari model)."""
+    id2 = st.session_state.get("ID2LABEL_override", ID2LABEL)
+    lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
+    return id2, lab2
 
 # ========= Page Layout =========
 st.markdown('<div class="main-card">', unsafe_allow_html=True)
@@ -755,22 +814,36 @@ elif page == "Modeling & Evaluasi":
             else:
                 st.dataframe(df_eval.head())
                 if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
+
+                    # --- Auto-detect urutan label pada sampel berlabel ---
+                    df_labeled = df_eval[df_eval['category'].isin(VALID_LABELS)]
+                    with st.spinner("🔧 Mencari urutan label terbaik (auto-detect)..."):
+                        detected_map, probe_acc = autodetect_label_mapping(df_labeled, sample_n=500)
+                    set_label_override(detected_map)
+
+                    with st.sidebar.expander("🧭 Active label map", expanded=True):
+                        st.write({"detected_map": detected_map, "probe_acc": round(probe_acc, 4)})
+
                     texts = df_eval['review_text'].astype(str).tolist()
                     with st.spinner("Inferensi cepat..."):
                         preds = predict_texts_dynamic(texts, batch_size=BATCH_SIZE, return_conf=False)
                     df_eval['predicted_category'] = preds; st.success("Evaluasi selesai! ✅")
+
                     order_names = DEFAULT_LABEL_ORDER
                     y_true = df_eval['category'].str.lower().tolist()
                     y_pred = df_eval['predicted_category'].str.lower().tolist()
+
                     st.subheader("🔢 Confusion Matrix")
                     cm = confusion_matrix(y_true, y_pred, labels=order_names)
                     fig_cm = px.imshow(cm, x=order_names, y=order_names, text_auto=True,
                                        labels=dict(x="Prediksi", y="Aktual", color="Jumlah"),
                                        title="Confusion Matrix")
                     st.plotly_chart(fig_cm, use_container_width=True)
+
                     st.subheader("📝 Classification Report")
                     report = classification_report(y_true, y_pred, labels=order_names, target_names=order_names, output_dict=True, zero_division=0)
                     st.dataframe(pd.DataFrame(report).T)
+
                     st.subheader("🥧 Proporsi Sentimen Prediksi")
                     counts = pd.Series(y_pred).value_counts().reindex(order_names).fillna(0)
                     st.plotly_chart(px.pie(values=counts.values, names=counts.index, title='Proporsi Sentimen Prediksi',
@@ -796,6 +869,7 @@ elif page == "Prediksi":
             st.download_button("Unduh Hasil Prediksi", dfp.to_csv(index=False).encode('utf-8'), "predicted_data.csv", "text/csv", use_container_width=True)
     else:
         st.info("Silakan proses data terlebih dahulu di halaman 'Preprocessing'.")
+
     st.subheader("Prediksi Ulasan Tunggal")
     user_input = st.text_area("Masukkan ulasan:", height=150)
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
@@ -816,12 +890,18 @@ elif page == "Prediksi":
                         logits = model(**enc).logits
                     probs = F.softmax(logits, dim=-1).detach().cpu().numpy().squeeze()
                     lid = int(np.argmax(probs)); conf = float(probs[lid]) * 100.0
-                    predicted = ID2LABEL.get(lid, "unknown")
+                    ACTIVE_ID2LABEL, _ = get_active_maps()
+                    predicted = ACTIVE_ID2LABEL.get(lid, "unknown")
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
             else: st.info(msg)
         else:
             st.warning("Mohon masukkan ulasan untuk dianalisis.")
+
+# Tampilkan mapping aktif saat ini (debug)
+with st.sidebar.expander("🧭 Active label map", expanded=False):
+    cur_id2, _ = get_active_maps()
+    st.write(cur_id2)
 
 st.markdown('</div>', unsafe_allow_html=True)
