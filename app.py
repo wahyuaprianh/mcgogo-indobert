@@ -36,6 +36,13 @@ USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
 AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
+# --- Single-pred tuning (with sensible defaults) ---
+TEMP = float(get_secret("TEMP", "1.2"))
+CONF_MIN = float(get_secret("CONF_MIN", "0.60"))
+NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))
+SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))
+STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))
+
 # ================== Threading & Perf ==================
 try:
     torch.set_grad_enabled(False)
@@ -555,56 +562,88 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
 
 # ==== Robust single-text prediction (chunking + weighted average) ====
 def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0.5):
-    """Split text into token-id chunks with [CLS]/[SEP]."""
+    """Split text into token-id chunks dengan overlap; selalu tambah [CLS]/[SEP]."""
     if USE_REMOTE:
-        return []  # tidak dipakai untuk remote
+        return []
     if max_len is None:
         max_len = MAX_LEN
     body_max = max_len - 2
     ids = tokenizer.encode(preprocess_for_model(text), add_special_tokens=False)
     if len(ids) <= body_max:
         return [tokenizer.build_inputs_with_special_tokens(ids)]
-    stride = max(32, int(body_max * stride_ratio))
+    # overlap
+    stride = max(16, int(body_max * stride_ratio))
     step = max(1, body_max - stride)
     chunks = []
-    for i in range(0, len(ids), step):
+    i = 0
+    while i < len(ids):
         body = ids[i:i + body_max]
         if not body:
             break
         chunks.append(tokenizer.build_inputs_with_special_tokens(body))
         if i + body_max >= len(ids):
             break
+        i += step
     return chunks
 
-def predict_single_robust(text: str):
-    """Prediksi tunggal yang tahan teks panjang: rata-rata probabilitas per chunk (berbobot panjang)."""
+def predict_single_robust(text: str, star_score: Optional[int] = None):
+    """
+    Single prediction kuat:
+    - pakai max_len 512 (SINGLE_MAXLEN) & overlap STRIDE_RATIO
+    - temperature scaling (TEMP)
+    - netral jika margin kecil (NEUTRAL_MARGIN)
+    - fallback ke bintang (1/2=neg, 3=neu, 4/5=pos) jika confidence < CONF_MIN
+    """
     if USE_REMOTE:
         p, c = remote_predict_batch([text], return_conf=True)
         return p[0], c[0]
 
     ACTIVE_ID2LABEL, _ = get_active_maps()
-    ids_chunks = _chunk_ids_for_model(text, max_len=MAX_LEN, stride_ratio=0.5)
-    if not ids_chunks:  # fallback
+    C = len(ACTIVE_ID2LABEL)
+
+    ids_chunks = _chunk_ids_for_model(text, max_len=SINGLE_MAXLEN, stride_ratio=STRIDE_RATIO)
+    if not ids_chunks:
         ids_chunks = [tokenizer.encode(preprocess_for_model(text), add_special_tokens=True)]
 
-    probs_sum = torch.zeros((1, len(ACTIVE_ID2LABEL)), dtype=torch.float32)
+    probs_sum = torch.zeros((C,), dtype=torch.float32)
     weight_sum = 0.0
 
     with torch.inference_mode():
         for ids in ids_chunks:
             input_ids = torch.tensor([ids], device=device)
             attn = torch.ones_like(input_ids)
+            # temperature scaling
             logits = model(input_ids=input_ids, attention_mask=attn).logits
-            probs = F.softmax(logits, dim=-1).float().cpu()  # 1 x C
+            logits = logits / max(1e-6, TEMP)
+            probs = F.softmax(logits, dim=-1).float().cpu().squeeze(0)  # (C,)
+            # bobot = panjang chunk (tanpa [CLS]/[SEP])
             w = max(1, input_ids.shape[1] - 2)
             probs_sum += probs * w
             weight_sum += w
 
-    avg_probs = (probs_sum / max(1.0, weight_sum)).squeeze(0).numpy()
-    lid = int(avg_probs.argmax())
-    conf = float(avg_probs[lid] * 100.0)
-    predicted = ACTIVE_ID2LABEL.get(lid, "unknown")
-    return predicted, conf
+    avg_probs = (probs_sum / max(1.0, weight_sum)).numpy()
+    # netral jika margin kecil
+    top2 = np.argsort(-avg_probs)[:2]
+    top, second = int(top2[0]), int(top2[1])
+    top_p, second_p = float(avg_probs[top]), float(avg_probs[second])
+    pred = ACTIVE_ID2LABEL.get(top, "neutral")
+    conf = top_p * 100.0
+
+    # aturan netral
+    if (top_p - second_p) < NEUTRAL_MARGIN:
+        pred = "neutral"
+        conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)  # kosmetik
+
+    # fallback ke bintang jika disediakan & confidence rendah
+    if star_score is not None and conf < (CONF_MIN * 100.0):
+        if star_score in (1, 2):
+            pred, conf = "negative", max(conf, 60.0)
+        elif star_score == 3:
+            pred, conf = "neutral", max(conf, 60.0)
+        elif star_score in (4, 5):
+            pred, conf = "positive", max(conf, 60.0)
+
+    return pred, conf
 
 # === Auto-detect label order (helper) ===
 def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
