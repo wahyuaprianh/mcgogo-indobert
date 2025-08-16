@@ -16,7 +16,6 @@ huggingface_hub==0.23.4
 
 # ML utils
 scikit-learn==1.4.2
-# (hapus imbalanced-learn kalau tidak dipakai)
 
 # Indo NLP
 Sastrawi==1.0.1
@@ -25,5 +24,5 @@ wordcloud==1.9.3
 emoji==2.12.1
 
 # Scraper & widget
-google-play-scraper==1.2.9
+google-play-scraper==1.2.7
 streamlit-carousel==0.0.5
