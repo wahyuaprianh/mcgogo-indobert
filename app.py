@@ -15,6 +15,14 @@ import torch.nn.functional as F
 import requests
 
 # ---------------- Secrets helper ----------------
+def show_image(src, caption=None):
+    # Kompatibel lintas versi Streamlit
+    try:
+        st.image(src, caption=caption, use_column_width=True)
+    except TypeError:
+        # fallback kalau versi sangat lama
+        st.image(src, caption=caption)
+
 def get_secret(name: str, default: str = "") -> str:
     try:
         v = st.secrets.get(name)
@@ -942,9 +950,9 @@ page = st.session_state.page
 if page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
     try:
-        st.image("image/home.jpg", use_column_width=True)
+        show.image("image/home.jpg", use_column_width=True)
     except Exception:
-        st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_column_width=True)
+        show.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_column_width=True)
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
     Aplikasi ini memanfaatkan **IndoBERT** untuk mengklasifikasikan sentimen ulasan pengguna.
