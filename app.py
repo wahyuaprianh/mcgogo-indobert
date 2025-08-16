@@ -347,6 +347,26 @@ def _norm_lbl(x: str) -> str:
     aliases = {"pos":"positive","positive":"positive","neg":"negative","negative":"negative","neu":"neutral","neutral":"neutral"}
     return aliases.get(x, x)
 
+# ==== Tampilan label yang dipaksa dari ID ====
+DISPLAY_ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
+def pretty_label_from_id(lid: int, raw: str = "") -> str:
+    nice = DISPLAY_ID2LABEL.get(int(lid))
+    if nice:
+        return nice
+    s = (raw or "").strip().lower()
+    if s.startswith("label_"):
+        try:
+            idx = int(s.split("_", 1)[1])
+            return DISPLAY_ID2LABEL.get(idx, s)
+        except Exception:
+            pass
+    aliases = {
+        "pos": "positive", "positive": "positive",
+        "neg": "negative", "negative": "negative",
+        "neu": "neutral",  "neutral":  "neutral",
+    }
+    return aliases.get(s, s or "unknown")
+
 # ========= Runtime params by mode =========
 def get_runtime_params(mode: str, device: torch.device):
     if mode == "Akurasi Tinggi":
@@ -369,7 +389,16 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
     for per_text in out:
         if not per_text: preds.append("neutral"); confs.append(0.0); continue
         best = max(per_text, key=lambda x: x.get("score", 0.0))
-        lbl = _norm_lbl(best.get("label", "neutral"))
+        raw_lbl = str(best.get("label", "neutral")).lower()
+        # jika "label_#", pakai mapping ID → pretty
+        if raw_lbl.startswith("label_"):
+            try:
+                idx = int(raw_lbl.split("_", 1)[1])
+                lbl = pretty_label_from_id(idx, raw_lbl)
+            except Exception:
+                lbl = _norm_lbl(raw_lbl)
+        else:
+            lbl = _norm_lbl(raw_lbl)
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
@@ -465,6 +494,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 10):
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
+    # id2label dari config (boleh saja "label_#"), tapi UI akan pakai pretty_label_from_id
     try:
         id2label = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
         label2id = {v: k for k, v in id2label.items()}
@@ -474,11 +504,15 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 10):
         id2label = {0: "negative", 1: "neutral", 2: "positive"}
         label2id = {v: k for k, v in id2label.items()}
 
-    if LABEL_MAP_RAW:  # hati-hati: ini override config repo
-        for pair in LABEL_MAP_RAW.split(","):
-            i, name = pair.split(":", 1)
-            id2label[int(i)] = str(name).strip().lower()
-        label2id = {v: k for k, v in id2label.items()}
+    # Override dari Secrets (opsional)
+    if LABEL_MAP_RAW:
+        try:
+            for pair in LABEL_MAP_RAW.split(","):
+                i, name = pair.split(":", 1)
+                id2label[int(i)] = str(name).strip().lower()
+            label2id = {v: k for k, v in id2label.items()}
+        except Exception:
+            pass
 
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
@@ -495,6 +529,15 @@ st.sidebar.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=T
 for key, label in {"Beranda":"🏠 Beranda","Scraping Data":"📥 Scraping Data","Preprocessing":"🧹 Preprocessing","Modeling & Evaluasi":"📊 Modeling & Evaluasi","Prediksi":"🔮 Prediksi"}.items():
     if st.sidebar.button(label, key=f"menu_{key}", use_container_width=True):
         st.session_state.page = key; st.rerun()
+
+# Tombol reload cache
+if st.sidebar.button("🔁 Reload model (clear cache)"):
+    try:
+        st.cache_resource.clear()
+        st.cache_data.clear()
+    except Exception:
+        pass
+    st.rerun()
 
 mode_choice = st.sidebar.radio("Mode Inference",
     options=["Cepat (disarankan)", "Akurasi Tinggi"],
@@ -540,13 +583,13 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             p, c = remote_predict_batch(texts[start:end], return_conf=True)
+            # pastikan label tampil rapi walau remote kirim label_#
+            p = [ _norm_lbl(x) if not str(x).startswith("label_") else pretty_label_from_id(int(str(x).split("_",1)[1]), str(x)) for x in p ]
             preds.extend(p); confs.extend(c)
             processed += (end - start)
             prog.progress(int(processed / N * 100))
             info.text(f"Memproses {processed}/{N} ({processed/N*100:.1f}%)")
         return (preds, confs) if return_conf else preds
-
-    ACTIVE_ID2LABEL, _ = get_active_maps()
 
     preds, confs = [], []
     prog = st.progress(0); info = st.empty()
@@ -568,11 +611,11 @@ def predict_texts_dynamic(texts: List[str], batch_size: int = BATCH_SIZE, return
             if return_conf:
                 probs = F.softmax(logits, dim=-1)
                 pred_ids = probs.argmax(dim=-1).tolist()
-                preds.extend([ACTIVE_ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+                preds.extend([pretty_label_from_id(int(i)) for i in pred_ids])
                 confs.extend((probs.max(dim=-1).values * 100).tolist())
             else:
                 pred_ids = logits.argmax(dim=-1).tolist()
-                preds.extend([ACTIVE_ID2LABEL.get(int(i), "unknown") for i in pred_ids])
+                preds.extend([pretty_label_from_id(int(i)) for i in pred_ids])
         processed += (end - start)
         if time.time() - last_ui > 0.25:
             prog.progress(int(processed / N * 100))
@@ -616,11 +659,18 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     """
     if USE_REMOTE:
         p, c = remote_predict_batch([text], return_conf=True)
-        return p[0], c[0]
+        # rapikan jika remote kirim label_#
+        pl = p[0]
+        if str(pl).startswith("label_"):
+            try:
+                idx = int(str(pl).split("_",1)[1]); pl = pretty_label_from_id(idx, str(pl))
+            except Exception:
+                pl = _norm_lbl(str(pl))
+        else:
+            pl = _norm_lbl(str(pl))
+        return pl, c[0]
 
-    ACTIVE_ID2LABEL, _ = get_active_maps()
-    C = len(ACTIVE_ID2LABEL)
-
+    C = 3  # kita kunci 3 kelas
     ids_chunks = _chunk_ids_for_model(text, max_len=SINGLE_MAXLEN, stride_ratio=STRIDE_RATIO)
     if not ids_chunks:
         ids_chunks = [tokenizer.encode(preprocess_for_model(text), add_special_tokens=True)]
@@ -643,7 +693,8 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     top2 = np.argsort(-avg_probs)[:2]
     top, second = int(top2[0]), int(top2[1])
     top_p, second_p = float(avg_probs[top]), float(avg_probs[second])
-    pred = ACTIVE_ID2LABEL.get(top, "neutral")
+
+    pred = pretty_label_from_id(top)
     conf = top_p * 100.0
 
     # aturan netral (margin kecil)
