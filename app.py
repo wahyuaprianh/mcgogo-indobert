@@ -1,4 +1,4 @@
-# app.py — FINAL (mapping sanitizer + anti-over-neutral + no-70%-clamp + remote label fix)
+# app.py — FINAL (mapping sanitizer + anti-over-neutral + remote label fix + carousel fallback + low-mem load)
 
 import os, re, base64, time, datetime, json
 from typing import Optional, Tuple, List, Dict
@@ -24,6 +24,9 @@ def get_secret(name: str, default: str = "") -> str:
         pass
     return os.getenv(name, default) or default
 
+# ========= App Config (set as early as possible) =========
+st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go Go Menggunakan IndoBERT")
+
 # ================== ENV (REMOTE/LOCAL) ==================
 MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-fp32")
 MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
@@ -34,7 +37,7 @@ REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
 USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 
 HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
-AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
+AUTH_KW = {"token": HF_TOKEN} if HF_TOKEN else {}  # Transformers >=4.41 pakai argumen "token"
 
 # --- Single-pred tuning (defaults; bisa diubah via sidebar) ---
 TEMP = float(get_secret("TEMP", "1.2"))
@@ -70,6 +73,14 @@ except Exception:
     pass
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
+# ================== UI helper (aman untuk berbagai versi Streamlit) ==================
+def show_image(src, caption=None):
+    """Wrapper agar tidak error di Streamlit versi lama/baru."""
+    try:
+        st.image(src, caption=caption, use_column_width=True)
+    except TypeError:
+        st.image(src, caption=caption)
+
 # ================== NLP utils ==================
 import nltk
 from nltk.corpus import stopwords
@@ -87,12 +98,14 @@ from transformers import (
 )
 from sklearn.metrics import confusion_matrix, classification_report
 
-# ================== Scraper & UI ==================
+# ================== Scraper & UI (carousel fallback) ==================
 from google_play_scraper import Sort, reviews
-from streamlit_carousel import carousel
+try:
+    from streamlit_carousel import carousel as st_carousel
+    HAS_CAROUSEL = True
+except Exception:
+    HAS_CAROUSEL = False
 
-# ========= App Config =========
-st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go Go Menggunakan IndoBERT")
 APP_ID = "com.mobilechess.gp"
 
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
@@ -106,6 +119,7 @@ LABEL_NAMES = ["positive","neutral","negative"]
 # ====== Panel kecil untuk cek Secrets ======
 with st.sidebar.expander("🔎 Secrets debug", expanded=False):
     st.write({
+        "MODEL_ID": MODEL_ID,
         "MODEL_ID_CPU_OVERRIDE": MODEL_ID_CPU_OVERRIDE,
         "USE_REMOTE": USE_REMOTE,
         "HF_TOKEN_set": bool(HF_TOKEN),
@@ -351,11 +365,6 @@ def _standardize_label(lbl: str) -> str:
     if l in VALID_LABELS:   return l
     return l
 
-def _norm_lbl(x: str) -> str:
-    x = (x or "").strip().lower()
-    aliases = {"pos":"positive","positive":"positive","neg":"negative","negative":"negative","neu":"neutral","neutral":"neutral"}
-    return aliases.get(x, x)
-
 # --- NEW: normalisasi label dari endpoint 'label_0/1/2' → nama human-readable
 LABEL_INDEX_RE = re.compile(r"label[_\s\-]?(\d+)$", re.I)
 def resolve_label_name(raw: str, id2label_fallback: Dict[int, str]) -> str:
@@ -399,7 +408,7 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
 
 # ========= Loader (mapping-safe, robust fallback) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 31):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -411,7 +420,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
     # (0) CPU override (opsional)
     if MODEL_ID_CPU_OVERRIDE:
         try:
-            cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH)
+            cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH_KW)
             if hasattr(cfg, "quantization_config"):
                 try: delattr(cfg, "quantization_config")
                 except: pass
@@ -421,7 +430,8 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
                 cfg.num_labels = 3
 
             model = BertForSequenceClassification.from_pretrained(
-                MODEL_ID_CPU_OVERRIDE, config=cfg, torch_dtype=torch.float32, **AUTH
+                MODEL_ID_CPU_OVERRIDE, config=cfg, torch_dtype=torch.float32,
+                low_cpu_mem_usage=True, **AUTH_KW
             )
             device = torch.device("cpu")
             model.to(device)
@@ -435,7 +445,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
     if model is None and use_cuda:
         try:
             model = BertForSequenceClassification.from_pretrained(
-                MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH
+                MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH_KW
             )
             device = next(model.parameters()).device
             loaded_bnb_8bit = True
@@ -443,13 +453,13 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
         except Exception as e:
             errors.append(f"cuda 8bit load failed ({MODEL_ID}): {e}")
             try:
-                cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
+                cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH_KW)
                 if hasattr(cfg, "quantization_config"):
                     try: delattr(cfg, "quantization_config")
                     except: pass
                     try: cfg.__dict__.pop("quantization_config", None)
                     except: pass
-                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
+                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH_KW)
                 device = torch.device("cuda")
                 model.to(device)
                 final_model_id = MODEL_ID
@@ -460,7 +470,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
     # (2) Coba MODEL_ID di CPU (FP32)
     if model is None:
         try:
-            cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
+            cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH_KW)
             if hasattr(cfg, "quantization_config"):
                 try: delattr(cfg, "quantization_config")
                 except: pass
@@ -470,7 +480,8 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
                 cfg.num_labels = 3
 
             model = BertForSequenceClassification.from_pretrained(
-                MODEL_ID, config=cfg, torch_dtype=torch.float32, **AUTH
+                MODEL_ID, config=cfg, torch_dtype=torch.float32,
+                low_cpu_mem_usage=True, **AUTH_KW
             )
             device = torch.device("cpu")
             model.to(device)
@@ -483,9 +494,10 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
     # (3) Fallback terakhir: base encoder
     if model is None:
         base_id = "indobenchmark/indobert-base-p1"
-        cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
+        cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH_KW)
         model = BertForSequenceClassification.from_pretrained(
-            base_id, config=cfg, torch_dtype=torch.float32, **AUTH
+            base_id, config=cfg, torch_dtype=torch.float32,
+            low_cpu_mem_usage=True, **AUTH_KW
         )
         device = torch.device("cpu")
         model.to(device)
@@ -510,9 +522,9 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
 
     # (5) Tokenizer
     try:
-        tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH)
+        tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH_KW)
     except Exception:
-        tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
+        tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH_KW)
 
     # (6) Mapping label dari config (atau default) + override via secrets + SANITIZER
     try:
@@ -524,8 +536,9 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
 
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
-            i, name = pair.split(":", 1)
-            id2label_cfg[int(i)] = str(name).strip().lower()
+            if ":" in pair:
+                i, name = pair.split(":", 1)
+                id2label_cfg[int(i)] = str(name).strip().lower()
 
     # --- SANITASI: jika label masih 'label_0/1/2' atau di luar set valid → pakai mapping default
     if any(str(v).lower().startswith("label_") for v in id2label_cfg.values()) or \
@@ -546,6 +559,14 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
         if errors: st.code("\n".join(errors))
+
+    # Peringatan jika bukan target
+    targets = [x for x in [MODEL_ID_CPU_OVERRIDE or None, MODEL_ID or None] if x]
+    if targets and final_model_id not in targets:
+        st.warning(
+            f"⚠️ Model yang termuat bukan target: `{final_model_id}`. "
+            f"Target: {targets}. Cek Secrets/HF_TOKEN/akses repo."
+        )
 
     return tokenizer, model, device, id2label_cfg, label2id_cfg
 
@@ -589,15 +610,16 @@ if USE_REMOTE:
     ID2LABEL = DEFAULT_ID2LABEL.copy()
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
-            i, name = pair.split(":",1)
-            ID2LABEL[int(i)] = _standardize_label(name)
+            if ":" in pair:
+                i, name = pair.split(":",1)
+                ID2LABEL[int(i)] = _standardize_label(name)
     LABEL2ID = {v:k for k,v in ID2LABEL.items()}
     tokenizer = None; model = None
 else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=24
+        quantize=use_quant_tmp, _v=31
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -771,7 +793,6 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
         return p[0], c[0]
 
     ACTIVE_ID2LABEL, _ = get_active_maps()
-    C = len(ACTIVE_ID2LABEL)
 
     ids_chunks = _chunk_ids_for_model(text, max_len=SINGLE_MAXLEN, stride_ratio=STRIDE_RATIO)
     if not ids_chunks:
@@ -854,7 +875,7 @@ def predict_single_with_contrast(text: str, star_score: Optional[int] = None, us
 
     pred, conf = predict_single_robust(text, star_score=star_score)
 
-    # >>> Lexicon override TANPA memaksa confidence ke angka tertentu (tidak 70% lagi)
+    # >>> Lexicon override TANPA memaksa confidence
     if use_lexicon_flag and conf < 95.0:
         score = _lexicon_score(text)
         if score <= -2 and pred != "negative":
@@ -907,9 +928,9 @@ page = st.session_state.page
 if page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
     try:
-        st.image("image/home.jpg", use_column_width=True)
+        show_image("image/home.jpg")
     except Exception:
-        st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_column_width=True)
+        show_image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home")
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
     Aplikasi ini memanfaatkan **IndoBERT** untuk mengklasifikasikan sentimen ulasan pengguna.
@@ -943,10 +964,20 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/the inferno.jpg"},
         {"title": "", "text": "", "img": "image/vonetis sea.jpg"},
     ]
-    try:
-        carousel(items=items)
-    except Exception as e:
-        st.warning(f"Carousel tidak dapat ditampilkan: {e}. Pastikan file gambarnya ada.")
+    if HAS_CAROUSEL:
+        try:
+            st_carousel(items=items)
+        except Exception as e:
+            st.warning(f"Carousel tidak dapat ditampilkan: {e}. Menampilkan grid gambar.")
+            cols = st.columns(3)
+            for i, it in enumerate(items[:9]):
+                with cols[i % 3]:
+                    show_image(it["img"])
+    else:
+        cols = st.columns(3)
+        for i, it in enumerate(items[:9]):
+            with cols[i % 3]:
+                show_image(it["img"])
 
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
