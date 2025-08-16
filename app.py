@@ -978,9 +978,10 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/the inferno.jpg"},
         {"title": "", "text": "", "img": "image/vonetis sea.jpg"},
     ]
-    idx = st.slider("Pilih sinergi", 1, len(items), 1, key="sinergi_idx")
-    item = items[idx-1]
-    st.image(item["img"], caption=item["title"], use_container_width=True)
+    cols = st.columns(4)
+    for i, path in enumerate(imgs):
+        with cols[i % 4]:
+            st.image(path, use_container_width=True)
 
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
