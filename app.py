@@ -989,9 +989,14 @@ if page == "Beranda":
     imgs = [(row["title"], row["img"]) for row in items]
     
     cols = st.columns(4)
-    for i, path in enumerate(imgs):
+    for i, it in enumerate(items):
         with cols[i % 4]:
-            st.image(path, use_container_width=True)
+            try:
+                st.image(it["img"], caption=it["title"], use_column_width=True)
+            except TypeError:
+                # fallback untuk versi Streamlit lama
+                st.image(it["img"], caption=it["title"])
+
 
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
