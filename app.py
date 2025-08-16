@@ -1,4 +1,4 @@
-# app.py — FINAL (anti-over-neutral + mapping-safe + remote-friendly)
+# app.py — FINAL (mapping sanitizer + anti-over-neutral + no-70%-clamp + remote label fix)
 
 import os, re, base64, time, datetime, json
 from typing import Optional, Tuple, List, Dict
@@ -26,8 +26,8 @@ def get_secret(name: str, default: str = "") -> str:
 
 # ================== ENV (REMOTE/LOCAL) ==================
 MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
-MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)  # optional CPU-only repo
-LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()  # optional override: "0:negative,1:neutral,2:positive"
+MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
+LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
 
 REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
 REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
@@ -36,20 +36,20 @@ USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
 AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
-# --- Single-pred tuning (defaults; nanti bisa diubah di sidebar) ---
-TEMP = float(get_secret("TEMP", "1.2"))                  # temperature scaling
-CONF_MIN = float(get_secret("CONF_MIN", "0.60"))         # confidence min untuk fallback bintang
-NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))  # margin top-2
-NEUTRAL_CAP_DEFAULT = float(get_secret("NEUTRAL_CAP", "0.60"))  # max top_p untuk boleh netral
-SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))        # panjang prediksi single (chunker)
-STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))       # overlap chunk
-CHUNK_AGG = "avg"  # default; akan diubah dari sidebar
+# --- Single-pred tuning (defaults; bisa diubah via sidebar) ---
+TEMP = float(get_secret("TEMP", "1.2"))
+CONF_MIN = float(get_secret("CONF_MIN", "0.60"))
+NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))
+NEUTRAL_CAP_DEFAULT = float(get_secret("NEUTRAL_CAP", "0.60"))
+SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))
+STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))
+CHUNK_AGG = "avg"
 
-# Toggle perilaku (bisa diubah di sidebar)
+# Toggle perilaku default
 DEFAULT_USE_CONTRAST = (get_secret("USE_CONTRAST", "true").lower() != "false")
 DEFAULT_USE_LEXICON  = (get_secret("USE_LEXICON", "true").lower()  != "false")
 
-# Kata penghubung KONTRAS yang sering muncul di ulasan ID
+# Kata penghubung KONTRAS (Bahasa Indonesia)
 CONTRAST_CUES = [
     "tetapi", "tapi", "namun", "akan tetapi",
     "semenjak", "sejak", "sayangnya", "padahal"
@@ -98,9 +98,9 @@ APP_ID = "com.mobilechess.gp"
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
 
-# >>> FIX: default mapping konsisten dgn config.json terbaru
+# >>> Default mapping konsisten dgn config.json yang benar
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
-DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # urutan tampil
+DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]
 LABEL_NAMES = ["positive","neutral","negative"]
 
 # ====== Panel kecil untuk cek Secrets ======
@@ -356,6 +356,19 @@ def _norm_lbl(x: str) -> str:
     aliases = {"pos":"positive","positive":"positive","neg":"negative","negative":"negative","neu":"neutral","neutral":"neutral"}
     return aliases.get(x, x)
 
+# --- NEW: normalisasi label dari endpoint 'label_0/1/2' → nama human-readable
+LABEL_INDEX_RE = re.compile(r"label[_\s\-]?(\d+)$", re.I)
+def resolve_label_name(raw: str, id2label_fallback: Dict[int, str]) -> str:
+    s = (raw or "").strip().lower()
+    s = _standardize_label(s)  # map pos/neg/neu ke bentuk penuh
+    if s in {"positive","neutral","negative"}:
+        return s
+    m = LABEL_INDEX_RE.search(s)
+    if m:
+        idx = int(m.group(1))
+        return id2label_fallback.get(idx, DEFAULT_ID2LABEL.get(idx, "neutral"))
+    return "neutral"  # fallback aman
+
 # ========= Runtime params by mode =========
 def get_runtime_params(mode: str, device: torch.device):
     if mode == "Akurasi Tinggi":
@@ -378,13 +391,15 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
     for per_text in out:
         if not per_text: preds.append("neutral"); confs.append(0.0); continue
         best = max(per_text, key=lambda x: x.get("score", 0.0))
-        lbl = _norm_lbl(best.get("label", "neutral"))
+        # pastikan label human-readable, bukan 'label_0'
+        active_id2, _ = get_active_maps()
+        lbl = resolve_label_name(best.get("label", "neutral"), active_id2)
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
 # ========= Loader (mapping-safe, robust fallback) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 23):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 24):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -499,7 +514,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 23):
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
-    # (6) Mapping label dari config (atau default) + override via secrets
+    # (6) Mapping label dari config (atau default) + override via secrets + SANITIZER
     try:
         id2label_cfg = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
         if len(id2label_cfg) != getattr(model.config, "num_labels", 3):
@@ -512,7 +527,19 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 23):
             i, name = pair.split(":", 1)
             id2label_cfg[int(i)] = str(name).strip().lower()
 
+    # --- SANITASI: jika label masih 'label_0/1/2' atau di luar set valid → pakai mapping default
+    if any(str(v).lower().startswith("label_") for v in id2label_cfg.values()) or \
+       not set(map(str, id2label_cfg.values())).issubset({"negative", "neutral", "positive"}):
+        id2label_cfg = {0:"negative", 1:"neutral", 2:"positive"}
+
     label2id_cfg = {v: k for k, v in id2label_cfg.items()}
+
+    # sinkronkan kembali ke config model
+    try:
+        model.config.id2label = {int(k): v for k, v in id2label_cfg.items()}
+        model.config.label2id = {v: int(k) for k, v in label2id_cfg.items()}
+    except Exception:
+        pass
 
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
@@ -556,7 +583,7 @@ NEUTRAL_CAP = st.sidebar.slider("Neutral cap (maks top_p utk netral)", 0.50, 0.8
 CHUNK_AGG = st.sidebar.radio("Chunk aggregation", ["avg", "max"], index=1,
     help="avg: rata-rata semua chunk; max: pilih chunk paling yakin (biasanya mengurangi netral).")
 
-# ========= Load model/tokenizer (skip kalau remote) =========
+# ========= Load model/tokenizer =========
 if USE_REMOTE:
     device = torch.device("cpu")
     ID2LABEL = DEFAULT_ID2LABEL.copy()
@@ -570,7 +597,7 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=23
+        quantize=use_quant_tmp, _v=24
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -585,7 +612,7 @@ def get_active_maps():
     lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
     return id2, lab2
 
-# ====== Proba util untuk kalibrasi (opsional) ======
+# ====== Proba util (opsional) ======
 def _predict_proba(texts: List[str], max_len: int = 512) -> np.ndarray:
     if USE_REMOTE:
         raise RuntimeError("Proba util tidak tersedia untuk remote.")
@@ -780,10 +807,7 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     pred = ACTIVE_ID2LABEL.get(top, "neutral")
     conf = top_p * 100.0
 
-    # >>> PERKETAT aturan netral:
-    # HANYA netral jika KEDUA syarat terpenuhi:
-    # 1) selisih top-2 kecil (margin), DAN
-    # 2) probabilitas top masih rendah (< NEUTRAL_CAP)
+    # >>> Perketat aturan netral:
     if (top_p - second_p) < NEUTRAL_MARGIN and top_p < NEUTRAL_CAP:
         pred = "neutral"
         conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)
@@ -791,11 +815,11 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     # fallback ke bintang jika disediakan & confidence rendah
     if star_score is not None and conf < (CONF_MIN * 100.0):
         if star_score in (1, 2):
-            pred, conf = "negative", max(conf, 60.0)
+            pred = "negative"
         elif star_score == 3:
-            pred, conf = "neutral", max(conf, 60.0)
+            pred = "neutral"
         elif star_score in (4, 5):
-            pred, conf = "positive", max(conf, 60.0)
+            pred = "positive"
 
     return pred, conf
 
@@ -819,7 +843,6 @@ def _extract_after_contrast(text: str) -> Optional[str]:
     return tail if len(tail.split()) >= 5 else None
 
 def predict_single_with_contrast(text: str, star_score: Optional[int] = None, use_contrast_flag: bool = True, use_lexicon_flag: bool = True):
-    # path 1: gunakan potongan setelah kata kontras
     if use_contrast_flag:
         tail = _extract_after_contrast(text)
         if tail:
@@ -829,20 +852,19 @@ def predict_single_with_contrast(text: str, star_score: Optional[int] = None, us
             if pred_tail == "positive" and conf_tail >= 70.0:
                 return pred_tail, conf_tail
 
-    # path 2: fallback seluruh kalimat
     pred, conf = predict_single_robust(text, star_score=star_score)
 
-    # path 3: Lexicon override (opsional, ringan)
+    # >>> Lexicon override TANPA memaksa confidence ke angka tertentu (tidak 70% lagi)
     if use_lexicon_flag and conf < 95.0:
         score = _lexicon_score(text)
         if score <= -2 and pred != "negative":
-            pred, conf = "negative", max(conf, 70.0)
+            pred = "negative"
         elif score >= 2 and pred != "positive":
-            pred, conf = "positive", max(conf, 70.0)
+            pred = "positive"
 
     return pred, conf
 
-# === Auto-detect label order (opsional; utk evaluasi berlabel) ===
+# === Auto-detect label order (opsional; untuk evaluasi berlabel) ===
 def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
     preds = []
     N = len(texts)
