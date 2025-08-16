@@ -1,5 +1,4 @@
-# app.py — FINAL (robust HF force-download + clearer errors + tokenizer fallback)
-# NOTE: fitur inti (anti-over-neutral, contrast-aware, scraping, EDA, evaluasi) tetap sama.
+# app.py — FINAL (token-only HF auth, force re-download, clearer errors, tokenizer fallback)
 
 import os, re, base64, time, datetime, json
 from typing import Optional, Tuple, List, Dict
@@ -35,13 +34,14 @@ REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
 USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 
 HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
-HF_REVISION  = (get_secret("HF_REVISION", "").strip() or "main")  # pakai "main" default
+HF_REVISION  = (get_secret("HF_REVISION", "").strip() or "main")  # default "main"
 
-AUTH = {}
-if HF_TOKEN:
-    # Transformers >=4.38 via huggingface_hub mendukung argumen 'token'
-    # sebagian env lama masih membaca 'use_auth_token'
-    AUTH = {"token": HF_TOKEN, "use_auth_token": HF_TOKEN}
+# Penting: gunakan HANYA 'token' (tanpa 'use_auth_token') → hindari ValueError di Transformers 4.55+
+def _hf_kwargs(force_download: bool = False) -> dict:
+    kw = dict(revision=HF_REVISION, local_files_only=False, force_download=force_download)
+    if HF_TOKEN:
+        kw["token"] = HF_TOKEN
+    return kw
 
 # --- Single-pred tuning (defaults; bisa diubah via sidebar) ---
 TEMP = float(get_secret("TEMP", "1.2"))
@@ -99,7 +99,7 @@ from google_play_scraper import Sort, reviews
 try:
     from streamlit_carousel import carousel
 except Exception:
-    carousel = None  # jika paket tidak tersedia, kita fallback aman
+    carousel = None
 
 # ========= App Config =========
 st.set_page_config(layout="wide", page_title="Analisis Sentimen Magic Chess : Go Go Menggunakan IndoBERT")
@@ -403,14 +403,8 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
     return (preds, confs) if return_conf else preds
 
 # ========= Loader (mapping-safe, robust fallback) =========
-def _hf_kwargs(force_download: bool = False) -> dict:
-    # helper kwargs untuk semua from_pretrained()
-    kw = dict(revision=HF_REVISION, local_files_only=False, force_download=force_download)
-    kw.update(AUTH)
-    return kw
-
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v: int = 25):
+def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v: int = 26):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -466,7 +460,7 @@ def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v:
                 errors.append(f"cuda fp32 load failed ({MODEL_ID}): {e2}")
                 model = None
 
-    # (2) Coba MODEL_ID di CPU (FP32) – force download dulu, jika gagal, coba tanpa force (cache)
+    # (2) Coba MODEL_ID di CPU (FP32) – force download dulu, lalu coba cache
     if model is None:
         try:
             cfg = AutoConfig.from_pretrained(MODEL_ID, **force_kwargs)
@@ -534,7 +528,7 @@ def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v:
 
     model.eval()
 
-    # (5) Tokenizer (paksa download jika disuruh)
+    # (5) Tokenizer
     tok = None
     tok_errors = []
     try:
@@ -545,7 +539,7 @@ def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v:
             tok = BertTokenizer.from_pretrained(final_model_id, **force_kwargs)
         except Exception as e2:
             tok_errors.append(f"tokenizer load failed ({final_model_id}): {e2}")
-            # fallback tokenizer base (supaya tetap bisa jalan)
+            # fallback tokenizer base
             try:
                 tok = BertTokenizer.from_pretrained("indobenchmark/indobert-base-p1", **noforce_kwargs)
                 tok_errors.append("Tokenizer fallback ke indobenchmark/indobert-base-p1")
@@ -578,7 +572,6 @@ def load_model_and_tokenizer(quantize: bool = False, force_dl: bool = False, _v:
     except Exception:
         pass
 
-    # Sidebar info
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
@@ -618,9 +611,8 @@ st.sidebar.markdown("---")
 use_contrast = st.sidebar.checkbox("Gunakan Contrast-aware", value=DEFAULT_USE_CONTRAST)
 use_lexicon  = st.sidebar.checkbox("Gunakan Lexicon override", value=DEFAULT_USE_LEXICON)
 
-# NEW: tombol paksa download ulang HF
 FORCE_HF_DOWNLOAD = st.sidebar.checkbox("🔄 Force re-download HF files", value=False,
-                                        help="Centang ini & klik tombol di bawah (atau rerun) untuk tarik snapshot terbaru dari Hugging Face, agar cache lama tidak dipakai.")
+                                        help="Centang ini agar snapshot terbaru dari Hugging Face diunduh ulang (menghindari cache lama).")
 
 # --- Anti-over-neutral controls ---
 st.sidebar.markdown("### ⚙️ Tuning Prediksi")
@@ -643,9 +635,8 @@ if USE_REMOTE:
 else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
-    # pass 'force_dl' untuk bust cache bila diinginkan
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, force_dl=FORCE_HF_DOWNLOAD, _v=25
+        quantize=use_quant_tmp, force_dl=FORCE_HF_DOWNLOAD, _v=26
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -854,12 +845,10 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     pred = ACTIVE_ID2LABEL.get(top, "neutral")
     conf = top_p * 100.0
 
-    # Perketat netral:
     if (top_p - second_p) < NEUTRAL_MARGIN and top_p < NEUTRAL_CAP:
         pred = "neutral"
         conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)
 
-    # fallback ke bintang jika ada & confidence rendah
     if star_score is not None and conf < (CONF_MIN * 100.0):
         if star_score in (1, 2):
             pred = "negative"
@@ -901,7 +890,6 @@ def predict_single_with_contrast(text: str, star_score: Optional[int] = None, us
 
     pred, conf = predict_single_robust(text, star_score=star_score)
 
-    # Lexicon override
     if use_lexicon_flag and conf < 95.0:
         score = _lexicon_score(text)
         if score <= -2 and pred != "negative":
