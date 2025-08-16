@@ -950,9 +950,9 @@ page = st.session_state.page
 if page == "Beranda":
     st.title("📊 Analisis Sentimen Magic Chess : Go Go Menggunakan Model IndoBERT")
     try:
-        show.image("image/home.jpg", use_column_width=True)
+        st.image("image/home.jpg", use_column_width=True)
     except Exception:
-        show.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_column_width=True)
+        st.image("https://placehold.co/1200x400/1a202c/ffffff?text=Magic+Chess+Home", use_column_width=True)
     st.markdown("""
     Selamat datang di dasbor **Analisis Sentimen Ulasan Aplikasi Magic Chess: Go Go**.
     Aplikasi ini memanfaatkan **IndoBERT** untuk mengklasifikasikan sentimen ulasan pengguna.
