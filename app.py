@@ -1,4 +1,4 @@
-# app.py — FINAL (strict override + secrets-aware + auto-calibration + robust single prediction)
+# app.py — FINAL (mapping-fixed + optional override + remote-friendly)
 
 import os, re, base64, time, datetime, json
 from typing import Optional, Tuple, List, Dict
@@ -26,8 +26,8 @@ def get_secret(name: str, default: str = "") -> str:
 
 # ================== ENV (REMOTE/LOCAL) ==================
 MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
-MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
-LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
+MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)  # optional: force CPU model id
+LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()  # optional override: "0:negative,1:neutral,2:positive"
 
 REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
 REMOTE_TOKEN = (get_secret("REMOTE_TOKEN", "").strip() or None)
@@ -42,6 +42,10 @@ CONF_MIN = float(get_secret("CONF_MIN", "0.60"))        # confidence min untuk f
 NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))  # margin top-2
 SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))       # paksa single pakai 512
 STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))      # overlap chunk
+
+# Toggle perilaku (bisa diubah di sidebar)
+DEFAULT_USE_CONTRAST = (get_secret("USE_CONTRAST", "true").lower() != "false")
+DEFAULT_USE_LEXICON  = (get_secret("USE_LEXICON", "true").lower()  != "false")
 
 # Kata penghubung KONTRAS yang sering muncul di ulasan ID
 CONTRAST_CUES = [
@@ -91,8 +95,10 @@ APP_ID = "com.mobilechess.gp"
 
 COLOR_MAP = {'positive': 'green', 'neutral': 'blue', 'negative': 'red'}
 VALID_LABELS = set(COLOR_MAP.keys())
+
+# >>> FIX: default mapping konsisten dgn config.json terbaru
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
-DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]
+DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # hanya untuk plotting/urut tampil
 LABEL_NAMES = ["positive","neutral","negative"]
 
 # ====== Panel kecil untuk cek Secrets ======
@@ -109,7 +115,7 @@ with st.sidebar.expander("🔎 Secrets debug", expanded=False):
         "STRIDE_RATIO": STRIDE_RATIO
     })
 
-# ========= UI Helpers =========
+# ========= UI Theme Helpers =========
 @st.cache_data
 def get_image_as_base64(path: str):
     if not os.path.exists(path): return None
@@ -373,9 +379,9 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
-# ========= Loader (STRICT OVERRIDE) =========
+# ========= Loader (STRICT but mapping-safe) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 20):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -384,6 +390,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 20):
     device = None
     final_model_id = None
 
+    # (1) CPU override (opsional)
     if MODEL_ID_CPU_OVERRIDE:
         try:
             cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH)
@@ -410,6 +417,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 20):
                 if errors: st.code("\n".join(errors))
             st.stop()
 
+    # (2) Coba GPU 8-bit → GPU FP32 → CPU FP32 base
     if model is None:
         if use_cuda:
             try:
@@ -445,6 +453,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 20):
             model.float()
             final_model_id = base_id
 
+    # (3) Quantize CPU (optional)
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
@@ -460,33 +469,35 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 20):
 
     model.eval()
 
+    # (4) Tokenizer
     try:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
+    # (5) Ambil mapping dari config model → fallback → secrets override
     try:
-        id2label = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
-        label2id = {v: k for k, v in id2label.items()}
-        if len(id2label) != getattr(model.config, "num_labels", 3):
+        id2label_cfg = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
+        if len(id2label_cfg) != getattr(model.config, "num_labels", 3):
             raise KeyError
     except Exception:
-        id2label = {0: "negative", 1: "neutral", 2: "positive"}
-        label2id = {v: k for k, v in id2label.items()}
+        id2label_cfg = DEFAULT_ID2LABEL.copy()
 
-    # Override dari Secrets jika ada
+    # >>> jika user pakai secrets LABEL_MAP, itu meng-override
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
             i, name = pair.split(":", 1)
-            id2label[int(i)] = str(name).strip().lower()
-        label2id = {v: k for k, v in id2label.items()}
+            id2label_cfg[int(i)] = str(name).strip().lower()
+
+    label2id_cfg = {v: k for k, v in id2label_cfg.items()}
 
     with st.sidebar.expander("⚙ Model Info", expanded=False):
         st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
+        st.write({"id2label": id2label_cfg})
 
-    return tokenizer, model, device, id2label, label2id
+    return tokenizer, model, device, id2label_cfg, label2id_cfg
 
 # ========= Sidebar & Mode =========
 if "page" not in st.session_state:
@@ -510,9 +521,14 @@ mode_choice = st.sidebar.radio("Mode Inference",
     help="Cepat: MAX_LEN=256, batching besar, quantization CPU.\nAkurasi Tinggi: MAX_LEN=512, tanpa quantization."
 )
 
+st.sidebar.markdown("---")
+use_contrast = st.sidebar.checkbox("Gunakan Contrast-aware", value=DEFAULT_USE_CONTRAST)
+use_lexicon  = st.sidebar.checkbox("Gunakan Lexicon override", value=DEFAULT_USE_LEXICON)
+
 # ========= Load model/tokenizer (skip kalau remote) =========
 if USE_REMOTE:
     device = torch.device("cpu")
+    # remote: percaya ke label string dari endpoint (sudah sesuai config.json)
     ID2LABEL = DEFAULT_ID2LABEL.copy()
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
@@ -524,7 +540,7 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=20
+        quantize=use_quant_tmp, _v=21
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -543,7 +559,6 @@ def get_active_maps():
 def _predict_proba(texts: List[str], max_len: int = 512) -> np.ndarray:
     """Return array shape (N, C) of probabilities"""
     if USE_REMOTE:
-        # tidak dipakai untuk remote
         raise RuntimeError("Proba util tidak tersedia untuk remote.")
     N = len(texts)
     C = len(get_active_maps()[0])
@@ -558,65 +573,23 @@ def _predict_proba(texts: List[str], max_len: int = 512) -> np.ndarray:
         out.append(probs)
     return np.vstack(out) if out else np.zeros((0, C), dtype=np.float32)
 
-# ==== Kalibrasi mapping via rating (weak labels) ====
-@st.cache_data(show_spinner=False)
-def calibrate_with_ratings(df_scraped: pd.DataFrame, max_each: int = 300) -> Optional[dict]:
-    if df_scraped is None or df_scraped.empty or "score" not in df_scraped.columns:
-        return None
-    def label_from_score(s):
-        if s in (1,2): return "negative"
-        if s == 3: return "neutral"
-        if s in (4,5): return "positive"
-        return None
-    df = df_scraped.copy()
-    df["weak"] = df["score"].map(label_from_score)
-    df = df[df["weak"].notna()]
-    if df.empty: return None
-
-    samples = {}
-    for lab in ("positive","neutral","negative"):
-        sub = df[df["weak"]==lab].head(max_each)
-        if not sub.empty: samples[lab] = sub["review_text"].astype(str).tolist()
-
-    if not samples: return None
-
-    means = {}
-    for lab, texts in samples.items():
-        probs = _predict_proba(texts, max_len=512)
-        means[lab] = probs.mean(axis=0)
-
-    taken, mapping = set(), {}
-    for lab in ("positive","neutral","negative"):
-        order = list(np.argsort(-means[lab]))
-        for j in order:
-            if j not in taken:
-                mapping[j] = lab
-                taken.add(j)
-                break
-    left_ids = set(range(len(list(means.values())[0]))) - set(mapping.keys())
-    left_labs = {"positive","neutral","negative"} - set(mapping.values())
-    for j, lab in zip(left_ids, left_labs):
-        mapping[j] = lab
-    return {int(k):v for k,v in mapping.items()}
-
-# ==== Kalibrasi mapping via probe kalimat ====
+# ==== Kalibrasi mapping via probe kalimat (opsional) ====
 def calibrate_label_map_probes() -> Tuple[dict, pd.DataFrame, dict]:
-    """Gunakan probe kalimat untuk kira-kira label mana = id mana."""
     probes = {
         "positive": [
-            "gamenya seru sekali dan menyenangkan", 
-            "saya suka dan puas dengan permainan ini", 
-            "bagus mantap lancar tanpa lag", 
+            "gamenya seru sekali dan menyenangkan",
+            "saya suka dan puas dengan permainan ini",
+            "bagus mantap lancar tanpa lag",
             "pengalaman bermain sangat baik rekomendasi"
         ],
         "neutral": [
-            "permainannya biasa saja tidak terlalu buruk", 
+            "permainannya biasa saja tidak terlalu buruk",
             "fitur cukup standar tidak ada keluhan berarti",
             "lumayan namun tidak istimewa",
             "biasa saja sesuai ekspektasi"
         ],
         "negative": [
-            "game ini buruk dan mengecewakan penuh bug", 
+            "game ini buruk dan mengecewakan penuh bug",
             "sangat jelek bikin kesal dan sering kalah",
             "lag parah tidak seimbang dan ngawur",
             "fiturnya tidak jelas dan ampas"
@@ -632,14 +605,12 @@ def calibrate_label_map_probes() -> Tuple[dict, pd.DataFrame, dict]:
     mapping = {}
     used = set()
     for lab in ["positive","neutral","negative"]:
-        # id terbaik untuk label ini = argmax kolom rata2
-        order = list(np.argsort(-means.loc[lab].values))  # besar -> kecil
+        order = list(np.argsort(-means.loc[lab].values))
         for j in order:
             if j not in used:
                 mapping[j] = lab
                 used.add(j)
                 break
-    # lengkapi bila ada yang kosong
     left_ids = set(range(means.shape[1])) - set(mapping.keys())
     left_labs = {"positive","neutral","negative"} - set(mapping.values())
     for j, lab in zip(left_ids, left_labs):
@@ -701,7 +672,7 @@ SENTI_LEX_NEG = {
     "ngawur","ga "," gak","tidak","tdk","buruk","ampas","hapus","kalah","jelek","lag","parah",
     "frustasi","kesal","error","bug","rusak","tidak adil","no counter","ga jelas","payah",
     "ngeframe","nge-lag","ngefreeze","berat","crash","ngaco","cacat","curang","toxic","rigged",
-    "tidak sinkron","ga sinkron","mengecewakan","benci","tidak suka","payah","anjir","anjay"
+    "tidak sinkron","ga sinkron","mengecewakan","benci","tidak suka","anjir","anjay"
 }
 SENTI_LEX_POS = {
     "bagus","seru","keren","mantap","menarik","suka","stabil","lancar","bagus banget",
@@ -714,7 +685,7 @@ def _lexicon_score(text: str) -> int:
     pos = sum(1 for w in SENTI_LEX_POS if w in t)
     return pos - neg  # <0 = negatif
 
-# ==== Robust single-text prediction (chunking + temperature + neutral margin + star fallback) ====
+# ==== Chunking helper ====
 def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0.5):
     if USE_REMOTE:
         return []
@@ -738,6 +709,7 @@ def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0
         i += step
     return chunks
 
+# ==== Robust single-text prediction (chunking + temperature + neutral margin + star fallback) ====
 def predict_single_robust(text: str, star_score: Optional[int] = None):
     if USE_REMOTE:
         p, c = remote_predict_batch([text], return_conf=True)
@@ -806,21 +778,23 @@ def _extract_after_contrast(text: str) -> Optional[str]:
     tail = t[j:].strip(" ,.:;!?\n\t-—")
     return tail if len(tail.split()) >= 5 else None
 
-def predict_single_with_contrast(text: str, star_score: Optional[int] = None):
-    tail = _extract_after_contrast(text)
-    if tail:
-        pred_tail, conf_tail = predict_single_robust(tail, star_score=star_score)
-        if (pred_tail == "negative" and conf_tail >= 55.0) or (pred_tail == "neutral" and conf_tail >= 60.0):
-            return pred_tail, conf_tail
-        if pred_tail == "positive" and conf_tail >= 70.0:
-            return pred_tail, conf_tail
+def predict_single_with_contrast(text: str, star_score: Optional[int] = None, use_contrast_flag: bool = True, use_lexicon_flag: bool = True):
+    # path 1: gunakan potongan setelah kata kontras
+    if use_contrast_flag:
+        tail = _extract_after_contrast(text)
+        if tail:
+            pred_tail, conf_tail = predict_single_robust(tail, star_score=star_score)
+            if (pred_tail == "negative" and conf_tail >= 55.0) or (pred_tail == "neutral" and conf_tail >= 60.0):
+                return pred_tail, conf_tail
+            if pred_tail == "positive" and conf_tail >= 70.0:
+                return pred_tail, conf_tail
 
-    # fallback: seluruh kalimat
+    # path 2: fallback seluruh kalimat
     pred, conf = predict_single_robust(text, star_score=star_score)
 
-    # ===== Lexicon override ringan =====
-    if conf < 95.0:
-        score = _lexicon_score(text if tail is None else tail)
+    # path 3: Lexicon override ringan (opsional)
+    if use_lexicon_flag and conf < 95.0:
+        score = _lexicon_score(text)
         if score <= -2 and pred != "negative":
             pred, conf = "negative", max(conf, 70.0)
         elif score >= 2 and pred != "positive":
@@ -848,7 +822,7 @@ def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int
 
 def autodetect_label_mapping(df_labeled: pd.DataFrame, sample_n: int = 500):
     if df_labeled.empty:
-        return {0:"positive",1:"neutral",2:"negative"}, 0.0
+        return DEFAULT_ID2LABEL.copy(), 0.0
     samp = df_labeled.sample(n=min(sample_n, len(df_labeled)), random_state=42)
     texts = samp["review_text"].astype(str).tolist()
     true_labels = samp["category"].str.lower().tolist()
@@ -1052,32 +1026,20 @@ elif page == "Modeling & Evaluasi":
 
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    if st.button("🧭 Kalibrasi mapping via Rating (weak labels)", use_container_width=True):
-                        if "df_scraped" in st.session_state and not st.session_state.df_scraped.empty:
-                            try:
-                                detected = calibrate_with_ratings(st.session_state.df_scraped)
-                                if detected:
-                                    set_label_override(detected)
-                                    st.success(f"Mapping terdeteksi dari rating: {detected}")
-                                else:
-                                    st.warning("Tidak cukup data untuk kalibrasi dari rating.")
-                            except Exception as e:
-                                st.error(f"Gagal kalibrasi dari rating: {e}")
-                        else:
-                            st.info("Belum ada data scraping di sesi ini.")
-                with c2:
-                    if st.button("🧪 Kalibrasi mapping via Probes", use_container_width=True):
+                    if st.button("🧪 Kalibrasi mapping via Probes (opsional)", use_container_width=True, disabled=USE_REMOTE):
                         try:
                             det, _, _ = calibrate_label_map_probes()
                             set_label_override(det)
                             st.success(f"Mapping terdeteksi (probes): {det}")
                         except Exception as e:
                             st.error(f"Gagal kalibrasi probes: {e}")
-                with c3:
+                with c2:
                     if st.button("♻️ Reset mapping ke default", use_container_width=True):
                         st.session_state.pop("ID2LABEL_override", None)
                         st.session_state.pop("LABEL2ID_override", None)
-                        st.experimental_rerun()
+                        st.rerun()
+                with c3:
+                    st.caption("Config.json sudah benar, jadi mapping default sudah aman ✅")
 
                 if st.button("⚡ Mulai Evaluasi Model", use_container_width=True):
                     texts = df_eval['review_text'].astype(str).tolist()
@@ -1134,7 +1096,11 @@ elif page == "Prediksi":
 
     if st.button("🎯 Hasil Deteksi", use_container_width=True):
         if user_input.strip():
-            predicted, conf = predict_single_with_contrast(user_input, star_score=star_val)
+            predicted, conf = predict_single_with_contrast(
+                user_input, star_score=star_val,
+                use_contrast_flag=use_contrast,
+                use_lexicon_flag=use_lexicon
+            )
             msg = f"Sentimen: **{predicted}** ({conf:.2f}%)"
             if predicted == 'positive': st.success(msg)
             elif predicted == 'negative': st.error(msg)
@@ -1146,7 +1112,7 @@ elif page == "Tes Chunking":
     st.header("🧪 Tes Chunking & Prob Detail (Single)")
     txt = st.text_area("Masukkan kalimat untuk inspeksi logits/prob:", height=160,
                        value="dari segi gameplay cukup menarik bagi saya, tetapi balancing sinergi buruk dan sering lag")
-    if st.button("👀 Inspect", use_container_width=True):
+    if st.button("👀 Inspect", use_container_width=True, disabled=USE_REMOTE):
         ACTIVE_ID2LABEL, _ = get_active_maps()
         chunks = _chunk_ids_for_model(txt, max_len=SINGLE_MAXLEN, stride_ratio=STRIDE_RATIO)
         rows = []
@@ -1161,6 +1127,7 @@ elif page == "Tes Chunking":
                 row["chunk_idx"] = ci
                 row["len_ids"] = int(input_ids.shape[1])
                 row["top_id"] = int(np.argmax(probs))
+                row["top_label"] = ACTIVE_ID2LABEL.get(row["top_id"], "unknown")
                 rows.append(row)
         st.dataframe(pd.DataFrame(rows))
 
@@ -1173,20 +1140,19 @@ with st.sidebar.expander("🧭 Active label map", expanded=True):
         if st.button("Reset mapping", use_container_width=True):
             st.session_state.pop("ID2LABEL_override", None)
             st.session_state.pop("LABEL2ID_override", None)
-            st.experimental_rerun()
+            st.rerun()
     with c2:
         if st.button("Swap Pos↔Neg", use_container_width=True):
             id2 = cur_id2.copy()
-            # tukar value "positive" dan "negative"
             pos_id = [k for k,v in id2.items() if v=="positive"]
             neg_id = [k for k,v in id2.items() if v=="negative"]
             if pos_id and neg_id:
                 id2[pos_id[0]], id2[neg_id[0]] = id2[neg_id[0]], id2[pos_id[0]]
                 set_label_override(id2)
-                st.experimental_rerun()
+                st.rerun()
     with c3:
         if st.button("Set default P/N/Neu", use_container_width=True):
-            set_label_override({0:"negative",1:"neutral",2:"positive"})
-            st.experimental_rerun()
+            set_label_override(DEFAULT_ID2LABEL.copy())
+            st.rerun()
 
 st.markdown('</div>', unsafe_allow_html=True)
