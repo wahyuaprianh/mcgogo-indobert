@@ -978,17 +978,13 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/the inferno.jpg"},
         {"title": "", "text": "", "img": "image/vonetis sea.jpg"},
     ]
-    if carousel is not None:
-        try:
-            carousel(items=items)
-        except Exception as e:
-            st.warning(f"Carousel tidak dapat ditampilkan: {e}. Pastikan file gambarnya ada.")
-    else:
-        st.caption("streamlit_carousel tidak terpasang. Lewati carousel.")
+    idx = st.slider("Pilih sinergi", 1, len(items), 1, key="sinergi_idx")
+    item = items[idx-1]
+    st.image(item["img"], caption=item["title"], use_container_width=True)
 
 elif page == "Scraping Data":
     st.header("📥 Scraping Data dari Google Play Store")
-    st.write(f"Mengambil ulasan untuk **Magic Chess: Bang Bang** (App ID: `{APP_ID}`).")
+    st.write(f"Mengambil ulasan untuk **Magic Chess: Go Go** (App ID: `{APP_ID}`).")
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Tanggal Mulai", datetime.date.today() - datetime.timedelta(days=30))
