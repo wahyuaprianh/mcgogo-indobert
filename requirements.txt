@@ -25,4 +25,4 @@ emoji==2.12.1
 
 # Scraper & widget
 google-play-scraper==1.2.7
-streamlit-carousel==0.0.5
+streamlit-carousel==1.1.2
