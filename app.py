@@ -25,7 +25,7 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default) or default
 
 # ================== ENV (REMOTE/LOCAL) ==================
-MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
+MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-fp32")
 MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)
 LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()
 
