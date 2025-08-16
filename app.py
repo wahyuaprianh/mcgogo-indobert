@@ -962,7 +962,7 @@ if page == "Beranda":
     """, unsafe_allow_html=True)
 
     st.subheader("Sinergi Hero Magic Chess Go Go")
-    items = [
+    IMG_PATHS = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
         {"title": "", "text": "", "img": "image/astro power.jpg"},
         {"title": "", "text": "", "img": "image/doomsworn.jpg"},
