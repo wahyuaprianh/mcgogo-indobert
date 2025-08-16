@@ -962,7 +962,7 @@ if page == "Beranda":
     """, unsafe_allow_html=True)
 
     st.subheader("Sinergi Hero Magic Chess Go Go")
-    IMG_PATHS = [
+    items = [
         {"title": "", "text": "", "img": "image/dragon altar.jpg"},
         {"title": "", "text": "", "img": "image/astro power.jpg"},
         {"title": "", "text": "", "img": "image/doomsworn.jpg"},
@@ -978,6 +978,8 @@ if page == "Beranda":
         {"title": "", "text": "", "img": "image/the inferno.jpg"},
         {"title": "", "text": "", "img": "image/vonetis sea.jpg"},
     ]
+    imgs = [(row["title"], row["img"]) for row in items]
+    
     cols = st.columns(4)
     for i, path in enumerate(imgs):
         with cols[i % 4]:
