@@ -1,4 +1,4 @@
-# app.py — FINAL (mapping-fixed + optional override + remote-friendly)
+# app.py — FINAL (anti-over-neutral + mapping-safe + remote-friendly)
 
 import os, re, base64, time, datetime, json
 from typing import Optional, Tuple, List, Dict
@@ -26,7 +26,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 # ================== ENV (REMOTE/LOCAL) ==================
 MODEL_ID        = get_secret("MODEL_ID", "wahyuaprian/indobert-sentiment-mcgogo-8bit")
-MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)  # optional: force CPU model id
+MODEL_ID_CPU_OVERRIDE = (get_secret("MODEL_ID_CPU_OVERRIDE", "").strip() or None)  # optional CPU-only repo
 LABEL_MAP_RAW   = get_secret("LABEL_MAP", "").strip()  # optional override: "0:negative,1:neutral,2:positive"
 
 REMOTE_URL   = (get_secret("REMOTE_URL", "").strip()   or None)
@@ -36,12 +36,14 @@ USE_REMOTE   = bool(REMOTE_URL and REMOTE_TOKEN)
 HF_TOKEN     = (get_secret("HF_TOKEN", "").strip() or None)  # jika repo HF private
 AUTH = {"token": HF_TOKEN} if HF_TOKEN else {}
 
-# --- Single-pred tuning (with sensible defaults) ---
-TEMP = float(get_secret("TEMP", "1.2"))                 # temperature scaling
-CONF_MIN = float(get_secret("CONF_MIN", "0.60"))        # confidence min untuk fallback bintang
+# --- Single-pred tuning (defaults; nanti bisa diubah di sidebar) ---
+TEMP = float(get_secret("TEMP", "1.2"))                  # temperature scaling
+CONF_MIN = float(get_secret("CONF_MIN", "0.60"))         # confidence min untuk fallback bintang
 NEUTRAL_MARGIN = float(get_secret("NEUTRAL_MARGIN", "0.10"))  # margin top-2
-SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))       # paksa single pakai 512
-STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))      # overlap chunk
+NEUTRAL_CAP_DEFAULT = float(get_secret("NEUTRAL_CAP", "0.60"))  # max top_p untuk boleh netral
+SINGLE_MAXLEN = int(get_secret("SINGLE_MAXLEN", "512"))        # panjang prediksi single (chunker)
+STRIDE_RATIO = float(get_secret("STRIDE_RATIO", "0.40"))       # overlap chunk
+CHUNK_AGG = "avg"  # default; akan diubah dari sidebar
 
 # Toggle perilaku (bisa diubah di sidebar)
 DEFAULT_USE_CONTRAST = (get_secret("USE_CONTRAST", "true").lower() != "false")
@@ -98,7 +100,7 @@ VALID_LABELS = set(COLOR_MAP.keys())
 
 # >>> FIX: default mapping konsisten dgn config.json terbaru
 DEFAULT_ID2LABEL = {0:"negative", 1:"neutral", 2:"positive"}
-DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # hanya untuk plotting/urut tampil
+DEFAULT_LABEL_ORDER = ["positive", "neutral", "negative"]  # urutan tampil
 LABEL_NAMES = ["positive","neutral","negative"]
 
 # ====== Panel kecil untuk cek Secrets ======
@@ -111,6 +113,7 @@ with st.sidebar.expander("🔎 Secrets debug", expanded=False):
         "TEMP": TEMP,
         "CONF_MIN": CONF_MIN,
         "NEUTRAL_MARGIN": NEUTRAL_MARGIN,
+        "NEUTRAL_CAP": NEUTRAL_CAP_DEFAULT,
         "SINGLE_MAXLEN": SINGLE_MAXLEN,
         "STRIDE_RATIO": STRIDE_RATIO
     })
@@ -379,9 +382,9 @@ def remote_predict_batch(texts: List[str], return_conf: bool = False):
         preds.append(lbl); confs.append(float(best.get("score", 0.0))*100.0)
     return (preds, confs) if return_conf else preds
 
-# ========= Loader (STRICT but mapping-safe) =========
+# ========= Loader (mapping-safe, robust fallback) =========
 @st.cache_resource
-def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
+def load_model_and_tokenizer(quantize: bool = False, _v: int = 23):
     errors = []
     use_cuda = torch.cuda.is_available()
     loaded_bnb_8bit = False
@@ -390,7 +393,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
     device = None
     final_model_id = None
 
-    # (1) CPU override (opsional)
+    # (0) CPU override (opsional)
     if MODEL_ID_CPU_OVERRIDE:
         try:
             cfg = AutoConfig.from_pretrained(MODEL_ID_CPU_OVERRIDE, **AUTH)
@@ -409,51 +412,72 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
             model.to(device)
             model.float()
             final_model_id = MODEL_ID_CPU_OVERRIDE
-
         except Exception as e:
             errors.append(f"OVERRIDE load failed for {MODEL_ID_CPU_OVERRIDE}: {e}")
-            with st.sidebar.expander("⚙ Model Info", expanded=True):
-                st.error(f"Gagal memuat MODEL_ID_CPU_OVERRIDE = `{MODEL_ID_CPU_OVERRIDE}`")
-                if errors: st.code("\n".join(errors))
-            st.stop()
+            model = None  # lanjut ke MODEL_ID
 
-    # (2) Coba GPU 8-bit → GPU FP32 → CPU FP32 base
-    if model is None:
-        if use_cuda:
-            try:
-                model = BertForSequenceClassification.from_pretrained(
-                    MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH
-                )
-                device = next(model.parameters()).device
-                loaded_bnb_8bit = True
-                final_model_id = MODEL_ID
-            except Exception as e:
-                errors.append(f"cuda 8bit load failed: {e}")
-                try:
-                    cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
-                    if hasattr(cfg, "quantization_config"):
-                        try: delattr(cfg, "quantization_config")
-                        except: pass
-                        try: cfg.__dict__.pop("quantization_config", None)
-                        except: pass
-                    model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
-                    device = torch.device("cuda")
-                    model.to(device)
-                    final_model_id = MODEL_ID
-                except Exception as e2:
-                    errors.append(f"cuda fp32 load failed: {e2}")
-        if model is None:
-            base_id = "indobenchmark/indobert-base-p1"
-            cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
+    # (1) Coba MODEL_ID di GPU (8-bit, lalu FP32)
+    if model is None and use_cuda:
+        try:
             model = BertForSequenceClassification.from_pretrained(
-                base_id, config=cfg, torch_dtype=torch.float32, **AUTH
+                MODEL_ID, load_in_8bit=True, device_map="auto", **AUTH
+            )
+            device = next(model.parameters()).device
+            loaded_bnb_8bit = True
+            final_model_id = MODEL_ID
+        except Exception as e:
+            errors.append(f"cuda 8bit load failed ({MODEL_ID}): {e}")
+            try:
+                cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
+                if hasattr(cfg, "quantization_config"):
+                    try: delattr(cfg, "quantization_config")
+                    except: pass
+                    try: cfg.__dict__.pop("quantization_config", None)
+                    except: pass
+                model = BertForSequenceClassification.from_pretrained(MODEL_ID, config=cfg, **AUTH)
+                device = torch.device("cuda")
+                model.to(device)
+                final_model_id = MODEL_ID
+            except Exception as e2:
+                errors.append(f"cuda fp32 load failed ({MODEL_ID}): {e2}")
+                model = None
+
+    # (2) Coba MODEL_ID di CPU (FP32)
+    if model is None:
+        try:
+            cfg = AutoConfig.from_pretrained(MODEL_ID, **AUTH)
+            if hasattr(cfg, "quantization_config"):
+                try: delattr(cfg, "quantization_config")
+                except: pass
+                try: cfg.__dict__.pop("quantization_config", None)
+                except: pass
+            if getattr(cfg, "num_labels", None) != 3:
+                cfg.num_labels = 3
+
+            model = BertForSequenceClassification.from_pretrained(
+                MODEL_ID, config=cfg, torch_dtype=torch.float32, **AUTH
             )
             device = torch.device("cpu")
             model.to(device)
             model.float()
-            final_model_id = base_id
+            final_model_id = MODEL_ID
+        except Exception as e:
+            errors.append(f"cpu load failed ({MODEL_ID}): {e}")
+            model = None
 
-    # (3) Quantize CPU (optional)
+    # (3) Fallback terakhir: base encoder
+    if model is None:
+        base_id = "indobenchmark/indobert-base-p1"
+        cfg = AutoConfig.from_pretrained(base_id, num_labels=3, **AUTH)
+        model = BertForSequenceClassification.from_pretrained(
+            base_id, config=cfg, torch_dtype=torch.float32, **AUTH
+        )
+        device = torch.device("cpu")
+        model.to(device)
+        model.float()
+        final_model_id = base_id
+
+    # (4) Quantize CPU (opsional)
     if device.type == "cpu" and quantize and not loaded_bnb_8bit:
         try:
             from torchao.quantization import quantize_, int8_dynamic
@@ -469,21 +493,20 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
 
     model.eval()
 
-    # (4) Tokenizer
+    # (5) Tokenizer
     try:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, use_fast=True, **AUTH)
     except Exception:
         tokenizer = BertTokenizer.from_pretrained(final_model_id, **AUTH)
 
-    # (5) Ambil mapping dari config model → fallback → secrets override
+    # (6) Mapping label dari config (atau default) + override via secrets
     try:
         id2label_cfg = {int(k): str(v).lower() for k, v in model.config.id2label.items()}
         if len(id2label_cfg) != getattr(model.config, "num_labels", 3):
             raise KeyError
     except Exception:
-        id2label_cfg = DEFAULT_ID2LABEL.copy()
+        id2label_cfg = {0:"negative", 1:"neutral", 2:"positive"}
 
-    # >>> jika user pakai secrets LABEL_MAP, itu meng-override
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
             i, name = pair.split(":", 1)
@@ -495,7 +518,7 @@ def load_model_and_tokenizer(quantize: bool = False, _v: int = 21):
         st.write(f"Use Remote: `{USE_REMOTE}`")
         st.write(f"Model: `{final_model_id}`")
         st.write(f"Device: `{device.type}`")
-        st.write({"id2label": id2label_cfg})
+        if errors: st.code("\n".join(errors))
 
     return tokenizer, model, device, id2label_cfg, label2id_cfg
 
@@ -525,10 +548,17 @@ st.sidebar.markdown("---")
 use_contrast = st.sidebar.checkbox("Gunakan Contrast-aware", value=DEFAULT_USE_CONTRAST)
 use_lexicon  = st.sidebar.checkbox("Gunakan Lexicon override", value=DEFAULT_USE_LEXICON)
 
+# --- Anti-over-neutral controls ---
+st.sidebar.markdown("### ⚙️ Tuning Prediksi")
+TEMP = st.sidebar.slider("Temperature (lebih kecil = lebih tegas)", 0.50, 1.50, float(TEMP), 0.05)
+NEUTRAL_MARGIN = st.sidebar.slider("Neutral margin (selisih top-2)", 0.00, 0.20, float(NEUTRAL_MARGIN), 0.01)
+NEUTRAL_CAP = st.sidebar.slider("Neutral cap (maks top_p utk netral)", 0.50, 0.80, float(NEUTRAL_CAP_DEFAULT), 0.01)
+CHUNK_AGG = st.sidebar.radio("Chunk aggregation", ["avg", "max"], index=1,
+    help="avg: rata-rata semua chunk; max: pilih chunk paling yakin (biasanya mengurangi netral).")
+
 # ========= Load model/tokenizer (skip kalau remote) =========
 if USE_REMOTE:
     device = torch.device("cpu")
-    # remote: percaya ke label string dari endpoint (sudah sesuai config.json)
     ID2LABEL = DEFAULT_ID2LABEL.copy()
     if LABEL_MAP_RAW:
         for pair in LABEL_MAP_RAW.split(","):
@@ -540,7 +570,7 @@ else:
     _tmp_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, use_quant_tmp = get_runtime_params(mode_choice, _tmp_device)
     tokenizer, model, device, ID2LABEL, LABEL2ID = load_model_and_tokenizer(
-        quantize=use_quant_tmp, _v=21
+        quantize=use_quant_tmp, _v=23
     )
 
 MAX_LEN, BATCH_SIZE, USE_QUANT = get_runtime_params(mode_choice, device)
@@ -555,9 +585,8 @@ def get_active_maps():
     lab2 = st.session_state.get("LABEL2ID_override", LABEL2ID)
     return id2, lab2
 
-# ====== Proba util untuk kalibrasi ======
+# ====== Proba util untuk kalibrasi (opsional) ======
 def _predict_proba(texts: List[str], max_len: int = 512) -> np.ndarray:
-    """Return array shape (N, C) of probabilities"""
     if USE_REMOTE:
         raise RuntimeError("Proba util tidak tersedia untuk remote.")
     N = len(texts)
@@ -573,7 +602,6 @@ def _predict_proba(texts: List[str], max_len: int = 512) -> np.ndarray:
         out.append(probs)
     return np.vstack(out) if out else np.zeros((0, C), dtype=np.float32)
 
-# ==== Kalibrasi mapping via probe kalimat (opsional) ====
 def calibrate_label_map_probes() -> Tuple[dict, pd.DataFrame, dict]:
     probes = {
         "positive": [
@@ -597,7 +625,7 @@ def calibrate_label_map_probes() -> Tuple[dict, pd.DataFrame, dict]:
     }
     rows = []
     for lab, sents in probes.items():
-        probs = _predict_proba(sents, max_len=512)  # (n, C)
+        probs = _predict_proba(sents, max_len=512)
         for p in probs:
             rows.append({"label": lab, **{f"p_{i}": float(p[i]) for i in range(len(p))}})
     df = pd.DataFrame(rows)
@@ -709,7 +737,7 @@ def _chunk_ids_for_model(text: str, max_len: int = None, stride_ratio: float = 0
         i += step
     return chunks
 
-# ==== Robust single-text prediction (chunking + temperature + neutral margin + star fallback) ====
+# ==== Robust single-text prediction (anti-over-neutral) ====
 def predict_single_robust(text: str, star_score: Optional[int] = None):
     if USE_REMOTE:
         p, c = remote_predict_batch([text], return_conf=True)
@@ -722,29 +750,41 @@ def predict_single_robust(text: str, star_score: Optional[int] = None):
     if not ids_chunks:
         ids_chunks = [tokenizer.encode(preprocess_for_model(text), add_special_tokens=True)]
 
-    probs_sum = torch.zeros((C,), dtype=torch.float32)
-    weight_sum = 0.0
-
+    # Prob per chunk
+    chunk_probs = []
     with torch.inference_mode():
         for ids in ids_chunks:
             input_ids = torch.tensor([ids], device=device)
             attn = torch.ones_like(input_ids)
             logits = model(input_ids=input_ids, attention_mask=attn).logits
-            logits = logits / max(1e-6, TEMP)  # temperature scaling
-            probs = F.softmax(logits, dim=-1).float().cpu().squeeze(0)  # (C,)
-            w = max(1, input_ids.shape[1] - 2)  # bobot = panjang chunk
-            probs_sum += probs * w
-            weight_sum += w
+            logits = logits / max(1e-6, TEMP)  # TEMP < 1 => lebih tajam
+            probs = F.softmax(logits, dim=-1).float().cpu().squeeze(0).numpy()
+            chunk_probs.append(probs)
+    chunk_probs = np.vstack(chunk_probs)  # (n_chunk, C)
 
-    avg_probs = (probs_sum / max(1.0, weight_sum)).numpy()
-    top2 = np.argsort(-avg_probs)[:2]
+    # Aggregator: avg (bobot panjang) atau max (chunk paling yakin)
+    if CHUNK_AGG == "max":
+        idx = int(np.argmax(chunk_probs.max(axis=1)))
+        agg_probs = chunk_probs[idx]
+    else:
+        weights = []
+        for ids in ids_chunks:
+            w = max(1, len(ids) - 2)
+            weights.append(w)
+        weights = np.array(weights, dtype=np.float32)
+        agg_probs = (chunk_probs * weights[:, None]).sum(axis=0) / max(1.0, weights.sum())
+
+    top2 = np.argsort(-agg_probs)[:2]
     top, second = int(top2[0]), int(top2[1])
-    top_p, second_p = float(avg_probs[top]), float(avg_probs[second])
+    top_p, second_p = float(agg_probs[top]), float(agg_probs[second])
     pred = ACTIVE_ID2LABEL.get(top, "neutral")
     conf = top_p * 100.0
 
-    # aturan netral (margin kecil)
-    if (top_p - second_p) < NEUTRAL_MARGIN:
+    # >>> PERKETAT aturan netral:
+    # HANYA netral jika KEDUA syarat terpenuhi:
+    # 1) selisih top-2 kecil (margin), DAN
+    # 2) probabilitas top masih rendah (< NEUTRAL_CAP)
+    if (top_p - second_p) < NEUTRAL_MARGIN and top_p < NEUTRAL_CAP:
         pred = "neutral"
         conf = max(conf, (1.0 - (top_p - second_p)) * 100.0 * 0.5)
 
@@ -792,7 +832,7 @@ def predict_single_with_contrast(text: str, star_score: Optional[int] = None, us
     # path 2: fallback seluruh kalimat
     pred, conf = predict_single_robust(text, star_score=star_score)
 
-    # path 3: Lexicon override ringan (opsional)
+    # path 3: Lexicon override (opsional, ringan)
     if use_lexicon_flag and conf < 95.0:
         score = _lexicon_score(text)
         if score <= -2 and pred != "negative":
@@ -802,7 +842,7 @@ def predict_single_with_contrast(text: str, star_score: Optional[int] = None, us
 
     return pred, conf
 
-# === Auto-detect label order (untuk evaluasi murni berlabel) ===
+# === Auto-detect label order (opsional; utk evaluasi berlabel) ===
 def predict_ids_only(texts: List[str], batch_size: int = BATCH_SIZE) -> List[int]:
     preds = []
     N = len(texts)
